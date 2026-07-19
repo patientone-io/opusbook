@@ -1,0 +1,13 @@
+# Środowiska wirtualne
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Pliki wyjściowe konwersji (nie wersjonujemy powstałych .opus)
+*.opus
+cover.jpg
+
+# Lokalne konfiguracje / sekrety
+.env
+*.env

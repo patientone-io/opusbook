@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opusbook"
+version = "1.2.0"
+description = "Fast, multi-format audio to Opus converter with Rich UI and auto-channel optimization"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+opusbook = "opusbook:main"
+
+[tool.setuptools]
+py-modules = ["opusbook"]
