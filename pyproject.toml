@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opusbook"
-version = "1.2.0"
+version = "1.1.0"
 description = "Fast, multi-format audio to Opus converter with Rich UI and auto-channel optimization"
 readme = "README.md"
 requires-python = ">=3.10"

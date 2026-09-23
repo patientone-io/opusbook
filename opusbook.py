@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "1.2.0"
+__version__ = "1.1.0"
 
 # ── Sprawdzenie zależności / Dependency check ───────────────────────────────
 try:
