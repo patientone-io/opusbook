@@ -3,6 +3,7 @@
 opusbook.py — Multi-format audio to Opus converter / Konwerter audio do formatu Opus
 Usage / Użycie: opusbook [path/ścieżka] [options/opcje]
 """
+from __future__ import annotations
 
 import argparse
 import json
@@ -13,9 +14,11 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+
+__version__ = "1.2.0"
 
 # ── Sprawdzenie zależności / Dependency check ───────────────────────────────
 try:
@@ -25,7 +28,6 @@ try:
     from rich.panel import Panel
     from rich.progress import (
         BarColumn,
-        MofNCompleteColumn,
         Progress,
         SpinnerColumn,
         TaskProgressColumn,
@@ -120,7 +122,8 @@ MESSAGES = {
         "summary_failed": "  [bold white]Errors:[/]        {count}",
         "summary_source": "  [bold white]Source size:[/]   [yellow]{size}[/]",
         "summary_opus": "  [bold white]Opus size:[/]     [cyan]{size}[/]",
-        "summary_saved": "  [bold white]Saved space:[/]   [green bold]{size}[/]",
+        "summary_saved_ok": "  [bold white]Saved space:[/]   [green bold]{size}[/]",
+        "summary_saved_neg": "  [bold white]Saved space:[/]   [red bold]{size} (output larger!)[/]",
         "summary_speed": "  [bold white]Speed:[/]         [dim]{speed:.1f} MB/s[/]",
         "summary_bitrate": "  [bold white]Bitrate:[/]       [cyan]{bitrate}[/]  [dim](64k — speech+music, 48k — voice only, 80k — full production)[/]",
         "summary_failed_hdr": "  [red bold]Failed files:[/]",
@@ -154,6 +157,14 @@ MESSAGES = {
         "cli_max_table_help": "Max rows in results table (default: 30)",
         "cli_dry_run_help": "Preview scheduled ffmpeg commands without executing",
         "cli_lang_help": "Interface language (auto, en, pl)",
+        "non_tty_bitrate": "[dim]No TTY detected — using default bitrate 64k (pass -b to override).[/]",
+        "aborted": "[red]Aborted by user (Ctrl+C). Waiting for workers to stop…[/]",
+        "invalid_jobs": "[red]Invalid --jobs value: {value!r}. Use an integer >= 1.[/]",
+        "invalid_max_table": "[red]Invalid --max-table value: {value!r}. Use an integer >= 1.[/]",
+        "delete_keep_conflict": "[red]Options --delete and --keep are mutually exclusive.[/]",
+        "unsupported_file": "[red]Unsupported audio format: {path}[/]",
+        "stat_error": "[yellow]Skipping unreadable file: {path}[/]",
+        "dry_run_header": "[bold cyan]DRY-RUN — planned ffmpeg commands:[/]",
     },
     "pl": {
         "missing_ffmpeg_title": "Brak zależności",
@@ -218,7 +229,8 @@ MESSAGES = {
         "summary_failed": "  [bold white]Błędy:[/]          {count}",
         "summary_source": "  [bold white]Rozmiar źródła:[/] [yellow]{size}[/]",
         "summary_opus": "  [bold white]Rozmiar Opus:[/]   [cyan]{size}[/]",
-        "summary_saved": "  [bold white]Zaoszczędzono:[/]  [green bold]{size}[/]",
+        "summary_saved_ok": "  [bold white]Zaoszczędzono:[/]  [green bold]{size}[/]",
+        "summary_saved_neg": "  [bold white]Zaoszczędzono:[/]  [red bold]{size} (output większy!)[/]",
         "summary_speed": "  [bold white]Prędkość:[/]       [dim]{speed:.1f} MB/s[/]",
         "summary_bitrate": "  [bold white]Bitrate:[/]        [cyan]{bitrate}[/]  [dim](64k — mowa+muzyka, 48k — narracja, 80k — pełna produkcja)[/]",
         "summary_failed_hdr": "  [red bold]Pliki z błędem:[/]",
@@ -252,6 +264,14 @@ MESSAGES = {
         "cli_max_table_help": "Maks. wierszy w tabeli wyników (domyślnie: 30)",
         "cli_dry_run_help": "Pokaż planowane komendy ffmpeg bez uruchamiania",
         "cli_lang_help": "Wymuś język interfejsu (auto, pl, en)",
+        "non_tty_bitrate": "[dim]Brak TTY — używam domyślnego bitrate 64k (zmień flagą -b).[/]",
+        "aborted": "[red]Przerwano przez użytkownika (Ctrl+C). Czekam na zatrzymanie wątków…[/]",
+        "invalid_jobs": "[red]Błędna wartość --jobs: {value!r}. Podaj liczbę całkowitą >= 1.[/]",
+        "invalid_max_table": "[red]Błędna wartość --max-table: {value!r}. Podaj liczbę całkowitą >= 1.[/]",
+        "delete_keep_conflict": "[red]Opcje --delete i --keep wykluczają się.[/]",
+        "unsupported_file": "[red]Niewspierany format audio: {path}[/]",
+        "stat_error": "[yellow]Pomijam nieczytelny plik: {path}[/]",
+        "dry_run_header": "[bold cyan]DRY-RUN — planowane komendy ffmpeg:[/]",
     },
 }
 
@@ -287,24 +307,33 @@ class ConversionResult:
     name: str
     source: Path
     output: Path
-    mp3_bytes: int
+    src_bytes: int
     opus_bytes: int
     duration_s: float
     status: str  # "ok" | "skipped" | "failed"
     audio_duration: float = 0.0
     error: str = ""
 
+    # Backward-compat aliases (old field name was mp3_bytes)
+    @property
+    def mp3_bytes(self) -> int:
+        return self.src_bytes
+
     @property
     def saved_bytes(self) -> int:
-        return self.mp3_bytes - self.opus_bytes
+        return self.src_bytes - self.opus_bytes
 
     @property
     def ratio(self) -> float:
-        return (self.saved_bytes / self.mp3_bytes * 100) if self.mp3_bytes else 0.0
+        return (self.saved_bytes / self.src_bytes * 100) if self.src_bytes else 0.0
+
+    @property
+    def src_mb(self) -> float:
+        return self.src_bytes / 1_048_576
 
     @property
     def mp3_mb(self) -> float:
-        return self.mp3_bytes / 1_048_576
+        return self.src_mb
 
     @property
     def opus_mb(self) -> float:
@@ -318,6 +347,7 @@ class ConversionResult:
 @dataclass
 class Stats:
     results: list[ConversionResult] = field(default_factory=list)
+    elapsed_s: float = 0.0  # wall-clock time of whole conversion phase
 
     @property
     def converted(self):
@@ -333,7 +363,7 @@ class Stats:
 
     @property
     def total_mp3_mb(self) -> float:
-        return sum(r.mp3_mb for r in self.converted)
+        return sum(r.src_mb for r in self.converted)
 
     @property
     def total_opus_mb(self) -> float:
@@ -349,7 +379,9 @@ class Stats:
 
     @property
     def avg_speed_mb(self) -> float:
-        """Average speed in MB/s (input audio)."""
+        """Wall-clock throughput in MB/s of source audio."""
+        if self.elapsed_s > 0:
+            return self.total_mp3_mb / self.elapsed_s if self.total_mp3_mb else 0.0
         total_t = sum(r.duration_s for r in self.converted)
         return self.total_mp3_mb / total_t if total_t > 0 else 0.0
 
@@ -687,46 +719,6 @@ def ffprobe_duration(file: Path, ffprobe: str) -> float:
         return 0.0
 
 
-def ffprobe_channels(file: Path, ffprobe: str) -> int:
-    """Number of audio channels (1=mono, 2=stereo; 0 on error)."""
-    if not ffprobe:
-        return 0
-    try:
-        out = subprocess.check_output(
-            [
-                ffprobe, "-v", "error",
-                "-select_streams", "a:0",
-                "-show_entries", "stream=channels",
-                "-of", "csv=p=0",
-                str(file),
-            ],
-            stderr=subprocess.DEVNULL, text=True, timeout=10,
-        )
-        return int(out.strip().split(",")[0])
-    except Exception:
-        return 0
-
-
-def ffprobe_has_cover(file: Path, ffprobe: str) -> bool:
-    """Checks if file contains embedded cover stream."""
-    if not ffprobe:
-        return False
-    try:
-        out = subprocess.check_output(
-            [
-                ffprobe, "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_type",
-                "-of", "csv=p=0",
-                str(file),
-            ],
-            stderr=subprocess.DEVNULL, text=True, timeout=10,
-        )
-        return "video" in out
-    except Exception:
-        return False
-
-
 def get_file_metadata(file: Path, ffprobe: str) -> tuple[float, int, bool]:
     """Single probe for duration, channel count, and cover art presence."""
     if not ffprobe:
@@ -743,14 +735,21 @@ def get_file_metadata(file: Path, ffprobe: str) -> tuple[float, int, bool]:
             stderr=subprocess.DEVNULL, text=True, timeout=10,
         )
         data = json.loads(out)
-        duration = float(data.get("format", {}).get("duration", 0.0))
-        
+        try:
+            duration = float(data.get("format", {}).get("duration", 0.0))
+        except (TypeError, ValueError):
+            duration = 0.0
+
         channels = 0
         has_cover = False
         for stream in data.get("streams", []):
             ctype = stream.get("codec_type")
-            if ctype == "audio":
-                channels = int(stream.get("channels", 0))
+            if ctype == "audio" and channels == 0:
+                # First audio stream wins (ffprobe a:0 semantics).
+                try:
+                    channels = int(stream.get("channels", 0))
+                except (TypeError, ValueError):
+                    channels = 0
             elif ctype == "video":
                 has_cover = True
         return duration, channels, has_cover
@@ -759,14 +758,15 @@ def get_file_metadata(file: Path, ffprobe: str) -> tuple[float, int, bool]:
 
 
 def extract_cover(file: Path, cover_path: Path, ffmpeg: str) -> bool:
-    """Extracts embedded cover to sidecar cover.jpg."""
+    """Extracts embedded cover to sidecar cover.jpg (always real JPEG)."""
     try:
         r = subprocess.run(
             [
                 ffmpeg, "-y", "-loglevel", "error",
                 "-i", str(file),
-                "-map", "0:v?",
-                "-c:v", "copy",
+                "-map", "0:v:0?",
+                "-c:v", "mjpeg",
+                "-q:v", "2",
                 "-frames:v", "1",
                 str(cover_path),
             ],
@@ -779,6 +779,15 @@ def extract_cover(file: Path, cover_path: Path, ffmpeg: str) -> bool:
         return False
 
 
+def _safe_unlink(path: Path) -> None:
+    """Best-effort removal of partial/failed output files."""
+    try:
+        if path.exists() and path.is_file():
+            path.unlink()
+    except OSError:
+        pass
+
+
 # ── Konwersja / Conversion ─────────────────────────────────────────────────
 
 def convert_file(
@@ -788,25 +797,42 @@ def convert_file(
     ffmpeg: str,
     ffprobe: str,
     duration: float,
-    progress,
-    inner_task_id,
+    progress=None,
+    inner_task_id=None,
     outer_task_id=None,
     dry_run: bool = False,
-    extracted_covers: set[Path] = None,
-    cover_lock: threading.Lock = None,
+    extracted_covers: set[Path] | None = None,
+    cover_lock: threading.Lock | None = None,
 ) -> ConversionResult:
     out = file.with_suffix(".opus")
-    mp3_bytes = file.stat().st_size
-
-    if out.exists() and not force:
-        if progress and outer_task_id is not None and duration > 0:
-            progress.advance(outer_task_id, duration)
+    try:
+        src_bytes = file.stat().st_size
+    except OSError as e:
         return ConversionResult(
             name=file.name,
             source=file,
             output=out,
-            mp3_bytes=mp3_bytes,
-            opus_bytes=out.stat().st_size,
+            src_bytes=0,
+            opus_bytes=0,
+            duration_s=0,
+            status="failed",
+            audio_duration=duration,
+            error=f"unreadable source: {e}"[:200],
+        )
+
+    if out.exists() and not force:
+        if progress is not None and outer_task_id is not None and duration > 0:
+            progress.advance(outer_task_id, duration)
+        try:
+            existing = out.stat().st_size if out.is_file() else 0
+        except OSError:
+            existing = 0
+        return ConversionResult(
+            name=file.name,
+            source=file,
+            output=out,
+            src_bytes=src_bytes,
+            opus_bytes=existing,
             duration_s=0,
             status="skipped",
             audio_duration=duration,
@@ -817,7 +843,7 @@ def convert_file(
         "-i", str(file),
         "-map_metadata", "0",
         "-map_chapters", "0",
-        "-map", "0:a",
+        "-map", "0:a:0",
         "-c:a", "libopus",
         "-application", "audio",
         "-b:a", bitrate,
@@ -830,13 +856,13 @@ def convert_file(
 
     if dry_run:
         console.print(f"  [dim]DRY:[/] {' '.join(args)}")
-        if progress and outer_task_id is not None and duration > 0:
+        if progress is not None and outer_task_id is not None and duration > 0:
             progress.advance(outer_task_id, duration)
         return ConversionResult(
             name=file.name,
             source=file,
             output=out,
-            mp3_bytes=mp3_bytes,
+            src_bytes=src_bytes,
             opus_bytes=0,
             duration_s=0,
             status="skipped",
@@ -858,6 +884,17 @@ def convert_file(
                 stderr_chunks.append(data)
             except Exception:
                 pass
+
+    def _advance(delta: float):
+        if delta <= 0 or progress is None:
+            return
+        try:
+            if inner_task_id is not None:
+                progress.advance(inner_task_id, delta)
+            if outer_task_id is not None:
+                progress.advance(outer_task_id, delta)
+        except Exception:
+            pass
 
     try:
         proc = subprocess.Popen(
@@ -881,9 +918,7 @@ def convert_file(
                             sec = min(sec, duration)
                         delta = sec - last_sec
                         if delta > 0:
-                            progress.advance(inner_task_id, delta)
-                            if outer_task_id is not None:
-                                progress.advance(outer_task_id, delta)
+                            _advance(delta)
                             last_sec = sec
                     except ValueError:
                         pass
@@ -896,18 +931,16 @@ def convert_file(
 
         delta_remaining = duration - last_sec
         if delta_remaining > 0:
-            if progress and inner_task_id is not None:
-                progress.advance(inner_task_id, delta_remaining)
-            if progress and outer_task_id is not None:
-                progress.advance(outer_task_id, delta_remaining)
+            _advance(delta_remaining)
 
         if proc.returncode != 0:
             err = "".join(stderr_chunks).strip()[:200]
+            _safe_unlink(out)
             return ConversionResult(
                 name=file.name,
                 source=file,
                 output=out,
-                mp3_bytes=mp3_bytes,
+                src_bytes=src_bytes,
                 opus_bytes=0,
                 duration_s=duration_s,
                 status="failed",
@@ -920,11 +953,12 @@ def convert_file(
             if out_dur == 0 or abs(out_dur - duration) / duration > 0.05:
                 err = (f"output duration {out_dur:.1f}s != source {duration:.1f}s"
                        if out_dur else "output has no audio stream")
+                _safe_unlink(out)
                 return ConversionResult(
                     name=file.name,
                     source=file,
                     output=out,
-                    mp3_bytes=mp3_bytes,
+                    src_bytes=src_bytes,
                     opus_bytes=0,
                     duration_s=duration_s,
                     status="failed",
@@ -939,23 +973,23 @@ def convert_file(
                     if cover_path not in extracted_covers:
                         if cover_path.exists():
                             extracted_covers.add(cover_path)
-                        else:
-                            if extract_cover(file, cover_path, ffmpeg):
-                                extracted_covers.add(cover_path)
-            else:
-                if cover_path not in extracted_covers:
-                    if cover_path.exists():
-                        extracted_covers.add(cover_path)
-                    else:
-                        if extract_cover(file, cover_path, ffmpeg):
+                        elif extract_cover(file, cover_path, ffmpeg):
                             extracted_covers.add(cover_path)
+            elif cover_path not in extracted_covers:
+                if cover_path.exists():
+                    extracted_covers.add(cover_path)
+                elif extract_cover(file, cover_path, ffmpeg):
+                    extracted_covers.add(cover_path)
 
-        opus_bytes = out.stat().st_size if out.exists() else 0
+        try:
+            opus_bytes = out.stat().st_size if out.exists() else 0
+        except OSError:
+            opus_bytes = 0
         return ConversionResult(
             name=file.name,
             source=file,
             output=out,
-            mp3_bytes=mp3_bytes,
+            src_bytes=src_bytes,
             opus_bytes=opus_bytes,
             duration_s=duration_s,
             status="ok",
@@ -968,14 +1002,18 @@ def convert_file(
                 proc.kill()
             except Exception:
                 pass
+        _safe_unlink(out)
         delta_remaining = duration - last_sec
-        if delta_remaining > 0 and progress and outer_task_id is not None:
-            progress.advance(outer_task_id, delta_remaining)
+        if delta_remaining > 0 and progress is not None and outer_task_id is not None:
+            try:
+                progress.advance(outer_task_id, delta_remaining)
+            except Exception:
+                pass
         return ConversionResult(
             name=file.name,
             source=file,
             output=out,
-            mp3_bytes=mp3_bytes,
+            src_bytes=src_bytes,
             opus_bytes=0,
             duration_s=0,
             status="failed",
@@ -986,7 +1024,17 @@ def convert_file(
 
 # ── Tabela i Podsumowanie / UI ─────────────────────────────────────────────
 
-def build_result_table(stats: Stats, max_rows: int = 30) -> Table:
+def _display_name(result: ConversionResult, base_dir: Path | None) -> str:
+    """Human-readable path: relative to base_dir when possible (fixes -r collisions)."""
+    try:
+        if base_dir is not None:
+            return str(result.source.relative_to(base_dir))
+    except (ValueError, OSError):
+        pass
+    return result.name
+
+
+def build_result_table(stats: Stats, max_rows: int = 30, base_dir: Path | None = None) -> Table:
     table = Table(
         box=box.ROUNDED,
         show_header=True,
@@ -1019,11 +1067,18 @@ def build_result_table(stats: Stats, max_rows: int = 30) -> Table:
     for r in shown:
         ratio_str = f"{r.ratio:.1f}%"
         style = ratio_color(r.ratio)
+        saved = fmt_mb(r.saved_mb)
+        if r.saved_mb > 0:
+            saved_cell = f"[green]{saved}[/]"
+        elif r.saved_mb < 0:
+            saved_cell = f"[red]{saved}[/]"
+        else:
+            saved_cell = saved
         table.add_row(
-            r.name,
-            fmt_mb(r.mp3_mb),
+            _display_name(r, base_dir),
+            fmt_mb(r.src_mb),
             fmt_mb(r.opus_mb),
-            f"[green]{fmt_mb(r.saved_mb)}[/]" if r.saved_mb > 0 else fmt_mb(r.saved_mb),
+            saved_cell,
             f"[{style}]{ratio_str}[/]",
             fmt_duration(r.audio_duration),
             f"{r.duration_s:.1f}s",
@@ -1032,8 +1087,8 @@ def build_result_table(stats: Stats, max_rows: int = 30) -> Table:
 
     for r in stats.skipped:
         table.add_row(
-            r.name,
-            fmt_mb(r.mp3_mb),
+            _display_name(r, base_dir),
+            fmt_mb(r.src_mb),
             "[dim]—[/]",
             "[dim]—[/]",
             "[dim]—[/]",
@@ -1044,8 +1099,8 @@ def build_result_table(stats: Stats, max_rows: int = 30) -> Table:
 
     for r in stats.failed:
         table.add_row(
-            r.name,
-            fmt_mb(r.mp3_mb),
+            _display_name(r, base_dir),
+            fmt_mb(r.src_mb),
             "[dim]—[/]",
             "[dim]—[/]",
             "[dim]—[/]",
@@ -1060,11 +1115,16 @@ def build_result_table(stats: Stats, max_rows: int = 30) -> Table:
 def build_summary_panel(stats: Stats, bitrate: str) -> Panel:
     ratio = stats.total_ratio
     bar_len = 30
-    filled = int(bar_len * ratio / 100)
+    clamped = max(0.0, min(100.0, ratio))
+    filled = int(bar_len * clamped / 100)
     bar = "█" * filled + "░" * (bar_len - filled)
     bar_style = ratio_color(ratio)
 
     total_audio_s = sum(r.audio_duration for r in stats.converted)
+    if stats.total_saved_mb >= 0:
+        saved_line = t("summary_saved_ok", size=fmt_mb(stats.total_saved_mb))
+    else:
+        saved_line = t("summary_saved_neg", size=fmt_mb(stats.total_saved_mb))
     lines = [
         t("summary_converted", count=len(stats.converted), duration=fmt_duration(total_audio_s)),
         t("summary_skipped", count=len(stats.skipped)),
@@ -1072,7 +1132,7 @@ def build_summary_panel(stats: Stats, bitrate: str) -> Panel:
         "",
         t("summary_source", size=fmt_mb(stats.total_mp3_mb)),
         t("summary_opus", size=fmt_mb(stats.total_opus_mb)),
-        t("summary_saved", size=fmt_mb(stats.total_saved_mb)),
+        saved_line,
         "",
         f"  [{bar_style}]{bar}[/] [{bar_style}]{ratio:.1f}%[/]",
         "",
@@ -1096,12 +1156,13 @@ def build_summary_panel(stats: Stats, bitrate: str) -> Panel:
 
 # ── Główna logika / CLI Entrypoint ─────────────────────────────────────────
 
-def main():
+def main(argv: list[str] | None = None):
     # Pre-parse language argument early to set correct locale for --help
+    raw_argv = sys.argv[1:] if argv is None else argv
     early_lang = None
-    for i, arg in enumerate(sys.argv):
-        if arg in ("--lang", "-l") and i + 1 < len(sys.argv):
-            early_lang = sys.argv[i + 1]
+    for i, arg in enumerate(raw_argv):
+        if arg in ("--lang", "-l") and i + 1 < len(raw_argv):
+            early_lang = raw_argv[i + 1]
         elif arg.startswith("--lang="):
             early_lang = arg.split("=", 1)[1]
     if early_lang:
@@ -1148,12 +1209,13 @@ def main():
         action="store_true",
         help=t("cli_force_help"),
     )
-    parser.add_argument(
+    keep_delete = parser.add_mutually_exclusive_group()
+    keep_delete.add_argument(
         "--keep",
         action="store_true",
         help=t("cli_keep_help"),
     )
-    parser.add_argument(
+    keep_delete.add_argument(
         "--delete",
         action="store_true",
         help=t("cli_delete_help"),
@@ -1176,23 +1238,44 @@ def main():
         default="auto",
         help=t("cli_lang_help"),
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "-V", "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    args = parser.parse_args(raw_argv)
 
     # Apply explicit language if provided
     if args.lang != "auto":
         set_lang(args.lang)
 
-    # Interactive bitrate selection if not provided
+    if args.jobs is None or args.jobs < 1:
+        console.print(t("invalid_jobs", value=args.jobs))
+        sys.exit(2)
+    if args.max_table is None or args.max_table < 1:
+        console.print(t("invalid_max_table", value=args.max_table))
+        sys.exit(2)
+
+    # Interactive bitrate selection if not provided.
+    # Non-TTY (cron/CI) must not block: fall back to 64k.
     if args.bitrate is None:
-        args.bitrate = select_with_arrows(
-            t("bitrate_prompt"),
-            options=[
-                ("48k", t("bitrate_48k")),
-                ("64k", t("bitrate_64k")),
-                ("80k", t("bitrate_80k")),
-            ],
-            default_idx=1,
-        )
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            console.print(t("non_tty_bitrate"))
+            args.bitrate = "64k"
+        else:
+            try:
+                args.bitrate = select_with_arrows(
+                    t("bitrate_prompt"),
+                    options=[
+                        ("48k", t("bitrate_48k")),
+                        ("64k", t("bitrate_64k")),
+                        ("80k", t("bitrate_80k")),
+                    ],
+                    default_idx=1,
+                )
+            except (EOFError, OSError):
+                console.print(t("non_tty_bitrate"))
+                args.bitrate = "64k"
 
     # Bitrate validation
     if not re.match(r"^\d{1,4}[kM]$", args.bitrate):
@@ -1228,17 +1311,37 @@ def main():
             )
         )
         sys.exit(1)
+    # Skip ffprobe hard requirement for pure dry-run without metadata? No —
+    # dry-run still needs durations for planning, keep requirement.
     console.print(
         f"  [dim]ffmpeg {ffver} → {ffmpeg}[/]\n"
         f"  [dim]ffprobe → {ffprobe}[/]\n"
     )
 
-    # ── Skanowanie plików / File scanning ──
+    # ── Skanowanie plików / Scanning ──
+    # Single-file mode: `opusbook song.mp3` converts just that file.
+    single_file_mode = root.is_file()
     with console.status(t("scanning_files"), spinner="dots"):
-        if args.recurse:
-            raw_files = sorted([p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS])
+        if single_file_mode:
+            if root.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
+                raw_files = [root]
+            else:
+                console.print(t("unsupported_file", path=root))
+                sys.exit(1)
+            scan_base = root.parent
+        elif root.is_dir():
+            scan_base = root
+            if args.recurse:
+                raw_files = sorted(
+                    [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS]
+                )
+            else:
+                raw_files = sorted(
+                    [p for p in root.glob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS]
+                )
         else:
-            raw_files = sorted([p for p in root.glob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS])
+            console.print(t("path_not_found", path=root))
+            sys.exit(1)
 
     if not raw_files:
         console.print(
@@ -1251,17 +1354,31 @@ def main():
 
     # ── Pobieranie metadanych / Probing metadata ──
     file_infos: list[FileInfo] = []
-    with console.status(t("probing_metadata"), spinner="dots") as status:
-        def get_meta(p):
-            duration, channels, has_cover = get_file_metadata(p, ffprobe)
-            return FileInfo(path=p, duration=duration, channels=channels, has_cover=has_cover)
+    try:
+        with console.status(t("probing_metadata"), spinner="dots") as status:
+            def get_meta(p):
+                duration, channels, has_cover = get_file_metadata(p, ffprobe)
+                return FileInfo(path=p, duration=duration, channels=channels, has_cover=has_cover)
 
-        with ThreadPoolExecutor(max_workers=min(16, (os.cpu_count() or 1) * 2)) as executor:
-            for i, info in enumerate(executor.map(get_meta, raw_files), 1):
-                status.update(t("probing_status", i=i, total=len(raw_files), name=info.path.name[:30]))
-                file_infos.append(info)
+            with ThreadPoolExecutor(max_workers=min(16, (os.cpu_count() or 1) * 2)) as executor:
+                for i, info in enumerate(executor.map(get_meta, raw_files), 1):
+                    status.update(t("probing_status", i=i, total=len(raw_files), name=info.path.name[:30]))
+                    file_infos.append(info)
+    except KeyboardInterrupt:
+        console.print(t("aborted"))
+        sys.exit(130)
 
-    total_mp3_mb = sum(info.path.stat().st_size for info in file_infos) / 1_048_576
+    def _safe_size(p: Path) -> int:
+        try:
+            return p.stat().st_size
+        except OSError:
+            try:
+                console.print(t("stat_error", path=p))
+            except Exception:
+                pass
+            return 0
+
+    total_mp3_mb = sum(_safe_size(info.path) for info in file_infos) / 1_048_576
     total_seconds = sum(info.duration for info in file_infos)
     covers_count = sum(1 for info in file_infos if info.has_cover)
     mono_count = sum(1 for info in file_infos if info.channels == 1)
@@ -1288,6 +1405,41 @@ def main():
     console.print()
     console.print(Panel.fit(header_line, border_style="cyan"))
 
+    stats = Stats()
+    extracted_covers: set[Path] = set()
+    cover_lock = threading.Lock()
+    stats_lock = threading.Lock()
+
+    # ── DRY-RUN: no Live progress (workers would corrupt UI) ──
+    if args.dry_run:
+        console.print()
+        console.print(t("dry_run_header"))
+        for info in file_infos:
+            effective = "32k" if (args.auto and info.channels == 1) else args.bitrate
+            result = convert_file(
+                file=info.path,
+                bitrate=effective,
+                force=args.force,
+                ffmpeg=ffmpeg,
+                ffprobe=ffprobe,
+                duration=info.duration,
+                progress=None,
+                inner_task_id=None,
+                outer_task_id=None,
+                dry_run=True,
+                extracted_covers=None,
+                cover_lock=None,
+            )
+            with stats_lock:
+                stats.results.append(result)
+        stats.results.sort(key=lambda r: str(r.source))
+        console.print()
+        console.print(build_result_table(stats, max_rows=args.max_table, base_dir=scan_base))
+        console.print()
+        console.print(build_summary_panel(stats, args.bitrate))
+        console.print()
+        return
+
     # ── Pasek postępu / Progress bar ──
     progress = Progress(
         SpinnerColumn(spinner_name="arc"),
@@ -1304,28 +1456,15 @@ def main():
         transient=False,
     )
 
-    stats = Stats()
     outer_task = progress.add_task(
         t("progress_all"),
         total=max(total_seconds, 0.001),
     )
 
-    extracted_covers = set()
-    cover_lock = threading.Lock()
-    stats_lock = threading.Lock()
-
-    def convert_worker(info):
+    def convert_worker(info, inner_task):
         effective_bitrate = args.bitrate
         if args.auto and info.channels == 1:
             effective_bitrate = "32k"
-
-        inner_task = progress.add_task(
-            f"  [cyan]└─ {info.path.name[:42]}[/]"
-            + (f"  [dim]([magenta]{effective_bitrate}[/])[/]" if args.auto and info.channels == 1 else ""),
-            total=max(info.duration, 0.001),
-        )
-        progress.update(inner_task, visible=True)
-
         result = convert_file(
             file=info.path,
             bitrate=effective_bitrate,
@@ -1336,28 +1475,93 @@ def main():
             progress=progress,
             inner_task_id=inner_task,
             outer_task_id=outer_task,
-            dry_run=args.dry_run,
+            dry_run=False,
             extracted_covers=extracted_covers,
             cover_lock=cover_lock,
         )
-
         with stats_lock:
             stats.results.append(result)
-        progress.remove_task(inner_task)
 
-    with progress:
-        with ThreadPoolExecutor(max_workers=args.jobs) as executor:
-            futures = [executor.submit(convert_worker, info) for info in file_infos]
-            for fut in futures:
-                fut.result()
+    wall_start = time.perf_counter()
+    try:
+        with progress:
+            # Manual executor (not `with`) so Ctrl+C can cancel pending futures.
+            executor = ThreadPoolExecutor(max_workers=args.jobs)
+            try:
+                future_to_info = {}
+                for info in file_infos:
+                    effective = "32k" if (args.auto and info.channels == 1) else args.bitrate
+                    suffix = (
+                        f"  [dim]([magenta]{effective}[/])[/]"
+                        if args.auto and info.channels == 1 else ""
+                    )
+                    inner = progress.add_task(
+                        f"  [cyan]└─ {info.path.name[:42]}[/]" + suffix,
+                        total=max(info.duration, 0.001),
+                    )
+                    fut = executor.submit(convert_worker, info, inner)
+                    # Attach inner task id for cleanup on completion.
+                    fut._opus_inner = inner  # type: ignore[attr-defined]
+                    future_to_info[fut] = info
+                for fut in as_completed(future_to_info):
+                    inner = getattr(fut, "_opus_inner", None)
+                    try:
+                        fut.result()
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as e:
+                        # Never let one file kill the whole batch; record failure.
+                        info = future_to_info[fut]
+                        with stats_lock:
+                            try:
+                                src_sz = info.path.stat().st_size
+                            except OSError:
+                                src_sz = 0
+                            stats.results.append(
+                                ConversionResult(
+                                    name=info.path.name,
+                                    source=info.path,
+                                    output=info.path.with_suffix(".opus"),
+                                    src_bytes=src_sz,
+                                    opus_bytes=0,
+                                    duration_s=0,
+                                    status="failed",
+                                    audio_duration=info.duration,
+                                    error=str(e)[:200],
+                                )
+                            )
+                    finally:
+                        if inner is not None:
+                            try:
+                                progress.remove_task(inner)
+                            except Exception:
+                                pass
+            except KeyboardInterrupt:
+                console.print(t("aborted"))
+                try:
+                    executor.shutdown(cancel_futures=True, wait=False)
+                except TypeError:
+                    # Python < 3.9 fallback (cancel_futures unsupported)
+                    executor.shutdown(wait=False)
+                sys.exit(130)
+            else:
+                executor.shutdown(wait=True)
+    except KeyboardInterrupt:
+        console.print(t("aborted"))
+        sys.exit(130)
+    finally:
+        try:
+            progress.stop()
+        except Exception:
+            pass
+    stats.elapsed_s = time.perf_counter() - wall_start
 
-    stats.results.sort(key=lambda r: r.name)
-    progress.stop()
+    stats.results.sort(key=lambda r: str(r.source))
 
     # ── Wyniki / Results ──
     console.print()
     if stats.converted or stats.skipped or stats.failed:
-        console.print(build_result_table(stats, max_rows=args.max_table))
+        console.print(build_result_table(stats, max_rows=args.max_table, base_dir=scan_base))
 
     console.print()
     console.print(build_summary_panel(stats, args.bitrate))
@@ -1369,13 +1573,19 @@ def main():
             do_delete = True
         elif args.keep:
             do_delete = False
+        elif not sys.stdin.isatty():
+            # Non-interactive without explicit flag → keep (safe default).
+            do_delete = False
         else:
-            do_delete = Prompt.ask(
-                t("delete_prompt"),
-                choices=MESSAGES[_CURRENT_LANG]["delete_choices"],
-                default=MESSAGES[_CURRENT_LANG]["delete_default"],
-                console=console,
-            ) == MESSAGES[_CURRENT_LANG]["delete_confirm_val"]
+            try:
+                do_delete = Prompt.ask(
+                    t("delete_prompt"),
+                    choices=MESSAGES[_CURRENT_LANG]["delete_choices"],
+                    default=MESSAGES[_CURRENT_LANG]["delete_default"],
+                    console=console,
+                ) == MESSAGES[_CURRENT_LANG]["delete_confirm_val"]
+            except (EOFError, OSError):
+                do_delete = False
 
         if do_delete:
             deleted, failed_del = 0, 0
