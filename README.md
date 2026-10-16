@@ -91,6 +91,8 @@ opusbook --version
 
 > Without `--delete`/`--keep` opusbook asks interactively whether to delete sources. In cron/CI (no TTY) it keeps files.
 
+Outputs are validated before replacing existing files, so failed `--force` conversions preserve the previous `.opus`. If multiple inputs would produce the same output (e.g. `chapter.mp3` and `chapter.m4b`), the batch stops before encoding. Conversion or source deletion errors return exit code `1`; Ctrl+C stops active encoders and returns `130`.
+
 ### 🧪 Development & tests
 
 ```bash
@@ -194,6 +196,8 @@ opusbook --version
 | `-V, --version` | Pokaż wersję i zakończ | — |
 
 > Bez `--delete`/`--keep` program pyta interaktywnie o usunięcie. W cron/CI (bez TTY) pliki są zachowywane.
+
+Wynik jest sprawdzany przed zastąpieniem istniejącego pliku, więc nieudana konwersja z `--force` zachowuje poprzedni `.opus`. Jeśli kilka źródeł prowadzi do tego samego wyniku (np. `rozdzial.mp3` i `rozdzial.m4b`), program zatrzymuje zadanie przed kodowaniem. Błędy konwersji lub usuwania źródeł zwracają kod `1`; Ctrl+C zatrzymuje aktywne procesy kodowania i zwraca `130`.
 
 ### 🧪 Development i testy
 

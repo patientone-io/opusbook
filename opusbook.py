@@ -6,19 +6,22 @@ Usage / Użycie: opusbook [path/ścieżka] [options/opcje]
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 # ── Sprawdzenie zależności / Dependency check ───────────────────────────────
 try:
@@ -165,6 +168,7 @@ MESSAGES = {
         "unsupported_file": "[red]Unsupported audio format: {path}[/]",
         "stat_error": "[yellow]Skipping unreadable file: {path}[/]",
         "dry_run_header": "[bold cyan]DRY-RUN — planned ffmpeg commands:[/]",
+        "output_collision": "[red]Multiple source files share the same output: {path}. Choose one source format before converting.[/]",
     },
     "pl": {
         "missing_ffmpeg_title": "Brak zależności",
@@ -272,6 +276,7 @@ MESSAGES = {
         "unsupported_file": "[red]Niewspierany format audio: {path}[/]",
         "stat_error": "[yellow]Pomijam nieczytelny plik: {path}[/]",
         "dry_run_header": "[bold cyan]DRY-RUN — planowane komendy ffmpeg:[/]",
+        "output_collision": "[red]Kilka plików źródłowych ma wspólny plik wynikowy: {path}. Przed konwersją wybierz jeden format źródłowy.[/]",
     },
 }
 
@@ -714,7 +719,8 @@ def ffprobe_duration(file: Path, ffprobe: str) -> float:
             ],
             stderr=subprocess.DEVNULL, text=True, timeout=10,
         )
-        return float(out.strip())
+        duration = float(out.strip())
+        return duration if math.isfinite(duration) and duration > 0 else 0.0
     except Exception:
         return 0.0
 
@@ -738,6 +744,8 @@ def get_file_metadata(file: Path, ffprobe: str) -> tuple[float, int, bool]:
         try:
             duration = float(data.get("format", {}).get("duration", 0.0))
         except (TypeError, ValueError):
+            duration = 0.0
+        if not math.isfinite(duration) or duration < 0:
             duration = 0.0
 
         channels = 0
@@ -788,6 +796,28 @@ def _safe_unlink(path: Path) -> None:
         pass
 
 
+def _publish_output(temp_out: Path, out: Path, force: bool) -> None:
+    if force:
+        os.replace(temp_out, out)
+        return
+    try:
+        os.link(temp_out, out)
+    except OSError as error:
+        if error.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV, errno.ENOSYS):
+            raise
+        # FAT and some network mounts do not support hard links. Exclusive
+        # creation still prevents overwriting another conversion's output.
+        with temp_out.open("rb") as source, out.open("xb") as target:
+            try:
+                shutil.copyfileobj(source, target)
+                target.flush()
+            except BaseException:
+                target.close()
+                _safe_unlink(out)
+                raise
+    _safe_unlink(temp_out)
+
+
 # ── Konwersja / Conversion ─────────────────────────────────────────────────
 
 def convert_file(
@@ -803,6 +833,7 @@ def convert_file(
     dry_run: bool = False,
     extracted_covers: set[Path] | None = None,
     cover_lock: threading.Lock | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> ConversionResult:
     out = file.with_suffix(".opus")
     try:
@@ -873,6 +904,8 @@ def convert_file(
     t0 = time.perf_counter()
     stderr_chunks: list[str] = []
     proc = None
+    temp_out = None
+    process_finished = threading.Event()
     last_sec = 0.0
 
     def _drain_stderr():
@@ -897,13 +930,32 @@ def convert_file(
             pass
 
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("conversion cancelled")
+        # Keep the previous output intact until encoding and validation succeed.
+        fd, temp_name = tempfile.mkstemp(prefix=f".{out.stem}.", suffix=".opus", dir=out.parent)
+        os.close(fd)
+        temp_out = Path(temp_name)
+        args[-1] = str(temp_out)
         proc = subprocess.Popen(
             args,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
+        def stop_when_cancelled():
+            while not process_finished.wait(0.1):
+                if cancel_event.is_set():
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    return
+
+        if cancel_event is not None:
+            threading.Thread(target=stop_when_cancelled, daemon=True).start()
         stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
         stderr_thread.start()
 
@@ -926,6 +978,7 @@ def convert_file(
                     break
 
         proc.wait()
+        process_finished.set()
         stderr_thread.join(timeout=2)
         duration_s = time.perf_counter() - t0
 
@@ -933,9 +986,9 @@ def convert_file(
         if delta_remaining > 0:
             _advance(delta_remaining)
 
-        if proc.returncode != 0:
+        if proc.returncode != 0 or (cancel_event is not None and cancel_event.is_set()):
             err = "".join(stderr_chunks).strip()[:200]
-            _safe_unlink(out)
+            _safe_unlink(temp_out)
             return ConversionResult(
                 name=file.name,
                 source=file,
@@ -948,23 +1001,32 @@ def convert_file(
                 error=err or f"ffmpeg exit {proc.returncode}",
             )
 
-        if duration > 0:
-            out_dur = ffprobe_duration(out, ffprobe)
-            if out_dur == 0 or abs(out_dur - duration) / duration > 0.05:
-                err = (f"output duration {out_dur:.1f}s != source {duration:.1f}s"
-                       if out_dur else "output has no audio stream")
-                _safe_unlink(out)
-                return ConversionResult(
-                    name=file.name,
-                    source=file,
-                    output=out,
-                    src_bytes=src_bytes,
-                    opus_bytes=0,
-                    duration_s=duration_s,
-                    status="failed",
-                    audio_duration=duration,
-                    error=err,
-                )
+        opus_bytes = temp_out.stat().st_size
+        out_dur = ffprobe_duration(temp_out, ffprobe)
+        if opus_bytes == 0 or out_dur <= 0 or (duration > 0 and abs(out_dur - duration) / duration > 0.05):
+            err = (f"output duration {out_dur:.1f}s != source {duration:.1f}s"
+                   if out_dur else "output has no audio stream")
+            _safe_unlink(temp_out)
+            return ConversionResult(
+                name=file.name,
+                source=file,
+                output=out,
+                src_bytes=src_bytes,
+                opus_bytes=0,
+                duration_s=duration_s,
+                status="failed",
+                audio_duration=duration,
+                error=err,
+            )
+
+        # mkstemp uses 0600; keep media readable wherever the source was readable.
+        mode = out.stat().st_mode & 0o777 if force and out.exists() else file.stat().st_mode & 0o666
+        try:
+            temp_out.chmod(mode)
+        except OSError:
+            # Some filesystems and network mounts do not support POSIX permissions.
+            pass
+        _publish_output(temp_out, out, force)
 
         if extracted_covers is not None:
             cover_path = file.parent / "cover.jpg"
@@ -981,10 +1043,6 @@ def convert_file(
                 elif extract_cover(file, cover_path, ffmpeg):
                     extracted_covers.add(cover_path)
 
-        try:
-            opus_bytes = out.stat().st_size if out.exists() else 0
-        except OSError:
-            opus_bytes = 0
         return ConversionResult(
             name=file.name,
             source=file,
@@ -996,13 +1054,17 @@ def convert_file(
             audio_duration=duration,
         )
 
-    except Exception as e:
+    except BaseException as e:
         if proc:
             try:
                 proc.kill()
+                proc.wait()
             except Exception:
                 pass
-        _safe_unlink(out)
+        if temp_out is not None:
+            _safe_unlink(temp_out)
+        if not isinstance(e, Exception):
+            raise
         delta_remaining = duration - last_sec
         if delta_remaining > 0 and progress is not None and outer_task_id is not None:
             try:
@@ -1020,6 +1082,8 @@ def convert_file(
             audio_duration=duration,
             error=str(e)[:200],
         )
+    finally:
+        process_finished.set()
 
 
 # ── Tabela i Podsumowanie / UI ─────────────────────────────────────────────
@@ -1352,6 +1416,14 @@ def main(argv: list[str] | None = None):
         )
         sys.exit(0)
 
+    outputs: set[Path] = set()
+    for source in raw_files:
+        output = source.with_suffix(".opus")
+        if output in outputs:
+            console.print(t("output_collision", path=output))
+            sys.exit(1)
+        outputs.add(output)
+
     # ── Pobieranie metadanych / Probing metadata ──
     file_infos: list[FileInfo] = []
     try:
@@ -1409,6 +1481,7 @@ def main(argv: list[str] | None = None):
     extracted_covers: set[Path] = set()
     cover_lock = threading.Lock()
     stats_lock = threading.Lock()
+    cancel_event = threading.Event()
 
     # ── DRY-RUN: no Live progress (workers would corrupt UI) ──
     if args.dry_run:
@@ -1478,6 +1551,7 @@ def main(argv: list[str] | None = None):
             dry_run=False,
             extracted_covers=extracted_covers,
             cover_lock=cover_lock,
+            cancel_event=cancel_event,
         )
         with stats_lock:
             stats.results.append(result)
@@ -1538,11 +1612,8 @@ def main(argv: list[str] | None = None):
                                 pass
             except KeyboardInterrupt:
                 console.print(t("aborted"))
-                try:
-                    executor.shutdown(cancel_futures=True, wait=False)
-                except TypeError:
-                    # Python < 3.9 fallback (cancel_futures unsupported)
-                    executor.shutdown(wait=False)
+                cancel_event.set()
+                executor.shutdown(cancel_futures=True, wait=True)
                 sys.exit(130)
             else:
                 executor.shutdown(wait=True)
@@ -1567,6 +1638,7 @@ def main(argv: list[str] | None = None):
     console.print(build_summary_panel(stats, args.bitrate))
 
     # ── Usuwanie oryginałów / Clean up source files ──
+    failed_del = 0
     if stats.converted:
         console.print()
         if args.delete:
@@ -1603,6 +1675,9 @@ def main(argv: list[str] | None = None):
             console.print(t("delete_kept"))
 
     console.print()
+
+    if stats.failed or failed_del:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

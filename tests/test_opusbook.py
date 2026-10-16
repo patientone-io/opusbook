@@ -1,5 +1,7 @@
 """Unit + integration tests for opusbook (mocked ffmpeg/ffprobe)."""
 import json
+import errno
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -148,11 +150,11 @@ def test_convert_unreadable_source(tmp_path):
     assert "unreadable" in r.error
 
 
-def test_convert_failure_unlinks_partial(tmp_path):
+def test_convert_failure_preserves_existing_output(tmp_path):
     src = tmp_path / "a.mp3"
     src.write_bytes(b"x" * 1000)
     out = src.with_suffix(".opus")
-    out.write_bytes(b"partial")
+    out.write_bytes(b"previous valid output")
 
     proc = MagicMock()
     proc.stdout = ["progress=end"]
@@ -164,12 +166,20 @@ def test_convert_failure_unlinks_partial(tmp_path):
         r = ob.convert_file(src, "64k", force=True, ffmpeg="ffmpeg", ffprobe="ffprobe",
                             duration=10.0, progress=None, inner_task_id=None)
     assert r.status == "failed"
-    assert not out.exists(), "partial .opus must be removed on failure"
+    assert out.read_bytes() == b"previous valid output"
+    assert not list(tmp_path.glob(".a.*.opus"))
 
 
-def test_convert_success_uses_first_audio_stream(tmp_path):
+@pytest.mark.parametrize("chmod_error", [False, True])
+def test_convert_success_uses_first_audio_stream(tmp_path, monkeypatch, chmod_error):
     src = tmp_path / "a.m4b"
     src.write_bytes(b"x" * 2048)
+
+    if chmod_error:
+        def unsupported_chmod(self, mode):
+            raise OSError(errno.EPERM, "Operation not permitted")
+
+        monkeypatch.setattr(Path, "chmod", unsupported_chmod)
 
     captured = {}
 
@@ -186,7 +196,7 @@ def test_convert_success_uses_first_audio_stream(tmp_path):
     def fake_popen(args, **kwargs):
         captured["args"] = args
         # simulate ffmpeg writing output file
-        (tmp_path / "a.opus").write_bytes(b"o" * 512)
+        Path(args[-1]).write_bytes(b"o" * 512)
         return proc
 
     with patch.object(subprocess, "Popen", side_effect=fake_popen):
@@ -201,6 +211,7 @@ def test_convert_success_uses_first_audio_stream(tmp_path):
     idx = captured["args"].index("-map")
     assert captured["args"][idx + 1] == "0:a:0"
     assert r.opus_bytes == 512
+    assert (tmp_path / "a.opus").read_bytes() == b"o" * 512
 
 
 # ── CLI validation ──────────────────────────────────────────────────
@@ -239,3 +250,140 @@ def test_cli_dry_run_no_ffmpeg_needed(tmp_path, monkeypatch):
     monkeypatch.setattr(ob, "get_file_metadata", lambda p, f: (60.0, 2, False))
     # should complete without raising (prints table + summary)
     ob.main([str(d), "-b", "64k", "--dry-run", "--keep"])
+
+
+@pytest.mark.parametrize("duration", [0.0, 60.0])
+def test_convert_rejects_missing_output(tmp_path, duration):
+    src = tmp_path / "empty.mp3"
+    src.write_bytes(b"source")
+    proc = MagicMock(returncode=0, stdout=[])
+    proc.stderr.read.return_value = ""
+    with patch.object(subprocess, "Popen", return_value=proc):
+        with patch.object(ob, "ffprobe_duration", return_value=0.0):
+            result = ob.convert_file(src, "64k", False, "ffmpeg", "ffprobe", duration)
+    assert result.status == "failed"
+    assert src.exists()
+    assert not src.with_suffix(".opus").exists()
+    assert not list(tmp_path.glob(".empty.*.opus"))
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_cli_rejects_output_collisions_before_probing(tmp_path, monkeypatch, force):
+    for suffix in (".mp3", ".m4b"):
+        (tmp_path / f"chapter{suffix}").write_bytes(b"source")
+    monkeypatch.setattr(ob, "check_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(ob, "get_ffmpeg_version", lambda p: "test")
+    monkeypatch.setattr(ob, "find_ffprobe", lambda: "ffprobe")
+    with patch.object(ob, "get_file_metadata") as probe:
+        with pytest.raises(SystemExit) as error:
+            ob.main([str(tmp_path), "-b", "64k", "--delete"] + (["--force"] if force else []))
+    assert error.value.code == 1
+    probe.assert_not_called()
+    assert len(list(tmp_path.iterdir())) == 2
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_publish_does_not_overwrite_racing_output(tmp_path, fallback):
+    temporary = tmp_path / "temporary.opus"
+    output = tmp_path / "chapter.opus"
+    temporary.write_bytes(b"new")
+    output.write_bytes(b"existing")
+    with patch.object(ob.os, "link", side_effect=OSError(errno.EOPNOTSUPP, "unsupported")) if fallback else patch.object(ob.os, "link", wraps=ob.os.link):
+        with pytest.raises(FileExistsError):
+            ob._publish_output(temporary, output, force=False)
+    assert output.read_bytes() == b"existing"
+
+
+def test_publish_without_hardlink_support(tmp_path):
+    temporary = tmp_path / "temporary.opus"
+    output = tmp_path / "chapter.opus"
+    temporary.write_bytes(b"new audio")
+    with patch.object(ob.os, "link", side_effect=OSError(errno.EOPNOTSUPP, "unsupported")):
+        ob._publish_output(temporary, output, force=False)
+    assert output.read_bytes() == b"new audio"
+    assert not temporary.exists()
+
+
+@pytest.mark.parametrize("invalid", ["nan", "inf", "-5"])
+def test_probe_rejects_invalid_duration(invalid):
+    with patch.object(subprocess, "check_output", return_value=invalid):
+        assert ob.ffprobe_duration(Path("audio.opus"), "ffprobe") == 0.0
+    payload = {"format": {"duration": invalid}, "streams": []}
+    with patch.object(subprocess, "check_output", return_value=json.dumps(payload)):
+        assert ob.get_file_metadata(Path("audio.mp3"), "ffprobe")[0] == 0.0
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg required")
+def test_real_cli_conversion_and_failed_force_preserves_audio(tmp_path):
+    ffmpeg = shutil.which("ffmpeg")
+    source = tmp_path / "voice.wav"
+    subprocess.run([
+        ffmpeg, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+        str(source),
+    ], check=True, capture_output=True)
+    cli = [sys.executable, str(Path(ob.__file__)), str(source), "-b", "64k", "--lang", "en"]
+    completed = subprocess.run(cli + ["--keep"], capture_output=True, text=True, timeout=20)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    output = source.with_suffix(".opus")
+    original_output = output.read_bytes()
+    assert ob.ffprobe_duration(output, shutil.which("ffprobe")) == pytest.approx(1, abs=0.05)
+
+    source.write_bytes(b"corrupted source")
+    failed = subprocess.run(cli + ["--force", "--delete"], capture_output=True, text=True, timeout=20)
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    assert source.read_bytes() == b"corrupted source"
+    assert output.read_bytes() == original_output
+    assert not list(tmp_path.glob(".voice.*.opus"))
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg required")
+def test_real_cli_delete_after_success(tmp_path):
+    import wave
+
+    source = tmp_path / "voice.wav"
+    with wave.open(str(source), "wb") as audio:
+        audio.setparams((1, 2, 48000, 0, "NONE", "not compressed"))
+        audio.writeframes(b"\0\0" * 48000)
+    completed = subprocess.run([
+        sys.executable, str(Path(ob.__file__)), str(source), "-b", "64k", "--delete",
+    ], capture_output=True, text=True, timeout=20)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert not source.exists()
+    assert source.with_suffix(".opus").stat().st_size > 0
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg required")
+def test_cancellation_stops_running_ffmpeg_and_preserves_output(tmp_path):
+    import threading
+    import wave
+
+    source = tmp_path / "voice.wav"
+    with wave.open(str(source), "wb") as audio:
+        audio.setparams((1, 2, 48000, 0, "NONE", "not compressed"))
+        audio.writeframes(b"\0\0" * 48000 * 3)
+    output = source.with_suffix(".opus")
+    output.write_bytes(b"existing audio")
+    cancelled = threading.Event()
+    real_popen = subprocess.Popen
+    processes = []
+    timers = []
+
+    def start_realtime(args, **kwargs):
+        args.insert(args.index("-i"), "-re")
+        process = real_popen(args, **kwargs)
+        processes.append(process)
+        timer = threading.Timer(0.2, cancelled.set)
+        timer.start()
+        timers.append(timer)
+        return process
+
+    with patch.object(subprocess, "Popen", side_effect=start_realtime):
+        result = ob.convert_file(source, "64k", True, shutil.which("ffmpeg"),
+                                 shutil.which("ffprobe"), 3.0, cancel_event=cancelled)
+    for timer in timers:
+        timer.join()
+    assert result.status == "failed"
+    assert processes[0].poll() is not None
+    assert output.read_bytes() == b"existing audio"
+    assert source.exists()
+    assert not list(tmp_path.glob(".voice.*.opus"))

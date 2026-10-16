@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-10-16
+
+### Fixed
+- Preserve existing Opus files when a forced conversion fails by encoding and validating temporary outputs first.
+- Reject batches where multiple sources would write to the same output path.
+- Validate output size and duration even when the source duration is unknown; reject non-finite duration metadata.
+- Return exit code `1` on conversion or source deletion errors.
+- Stop running FFmpeg processes and clean temporary outputs on Ctrl+C; detach encoder stdin from the terminal.
+- Tolerate chmod failures on filesystems without POSIX permissions (e.g. FAT/SMB).
+
 ## [1.1.0] - 2026-09-23
 
 ### Added
