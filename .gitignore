@@ -1,8 +1,23 @@
 # Środowiska wirtualne
 venv/
 .venv/
+uv.lock
 __pycache__/
 *.pyc
+*.pyo
+
+# Build / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Testy / lint
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
 # Pliki wyjściowe konwersji (nie wersjonujemy powstałych .opus)
 *.opus
