@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Bind metadata to the source version before probing and reject changed files before encoding, including files changed while queued.
+- Handle hardlinked inputs without mistaking our own unlinks for content changes; verify content hashes before deleting remaining names.
+- Revalidate changed cover cache entries and verify retained cover files before deleting originals.
+- Report metadata inspection failures in dry-run exit status.
+- Validate conversions against the first audio stream's duration instead of the whole container when stream duration is available.
+- Check the published output's identity, size, and timestamps before deleting its source; keep originals when outputs disappear or change.
+- Use short temporary filenames so valid long source and output names remain convertible.
+- Allow small Opus duration overhead for short clips without relaxing checks for truncated audio.
+- Check source identity, size, and timestamps before publishing output and deleting originals; keep changed sources and report an error.
+- Validate existing cover images and export replacements through temporary files; preserve sources and previous Opus outputs when metadata inspection or cover export fails.
+- Retain restrictive permissions when publishing audio on filesystems without hard-link support.
+- Render paths, filenames, and error messages literally in the terminal instead of interpreting them as Rich markup.
+
 ## [1.1.1] - 2026-10-16
 
 ### Fixed

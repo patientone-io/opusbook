@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import json
 import math
 import os
@@ -18,7 +19,9 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 
 __version__ = "1.1.1"
@@ -28,6 +31,7 @@ try:
     from rich import box
     from rich.console import Console
     from rich.live import Live
+    from rich.markup import escape
     from rich.panel import Panel
     from rich.progress import (
         BarColumn,
@@ -86,7 +90,7 @@ MESSAGES = {
         "bitrate_48k": "speech only (voice without music)",
         "bitrate_64k": "speech + music (default, audio plays)",
         "bitrate_80k": "full production (music + sound effects)",
-        "invalid_bitrate": "[red]Invalid bitrate: {bitrate!r}. Use e.g. 48k, 64k, 128k, 1M.[/]",
+        "invalid_bitrate": "[red]Invalid bitrate: {bitrate}. Use e.g. 48k, 64k, 128k, 1M.[/]",
         "bitrate_low_warn": "[yellow]⚠ Bitrate < 32k — quality may be degraded for music[/]",
         "bitrate_high_warn": "[yellow]⚠ Bitrate > 256k — overkill for speech[/]",
         "path_not_found": "[red]Path does not exist: {path}[/]",
@@ -169,6 +173,11 @@ MESSAGES = {
         "stat_error": "[yellow]Skipping unreadable file: {path}[/]",
         "dry_run_header": "[bold cyan]DRY-RUN — planned ffmpeg commands:[/]",
         "output_collision": "[red]Multiple source files share the same output: {path}. Choose one source format before converting.[/]",
+        "source_changed": "Source changed since conversion started; refusing to delete or replace files.",
+        "cover_export_failed": "Could not save a valid cover image; source kept.",
+        "metadata_failed": "Could not inspect source metadata; source kept.",
+        "output_changed": "Output changed or disappeared after conversion; source kept.",
+        "cover_changed": "Cover image changed or disappeared after conversion; source kept.",
     },
     "pl": {
         "missing_ffmpeg_title": "Brak zależności",
@@ -194,7 +203,7 @@ MESSAGES = {
         "bitrate_48k": "sama narracja (lektor bez muzyki)",
         "bitrate_64k": "mowa + muzyka (domyślne, słuchowiska)",
         "bitrate_80k": "pełna produkcja (muzyka + efekty)",
-        "invalid_bitrate": "[red]Błędny bitrate: {bitrate!r}. Użyj np. 48k, 64k, 128k, 1M.[/]",
+        "invalid_bitrate": "[red]Błędny bitrate: {bitrate}. Użyj np. 48k, 64k, 128k, 1M.[/]",
         "bitrate_low_warn": "[yellow]⚠ Bitrate < 32k — jakość może być słaba dla muzyki[/]",
         "bitrate_high_warn": "[yellow]⚠ Bitrate > 256k — przepłacanie dla mowy[/]",
         "path_not_found": "[red]Ścieżka nie istnieje: {path}[/]",
@@ -277,6 +286,11 @@ MESSAGES = {
         "stat_error": "[yellow]Pomijam nieczytelny plik: {path}[/]",
         "dry_run_header": "[bold cyan]DRY-RUN — planowane komendy ffmpeg:[/]",
         "output_collision": "[red]Kilka plików źródłowych ma wspólny plik wynikowy: {path}. Przed konwersją wybierz jeden format źródłowy.[/]",
+        "source_changed": "Źródło zmieniło się od rozpoczęcia konwersji; odmawiam usunięcia lub zastąpienia plików.",
+        "cover_export_failed": "Nie udało się zapisać poprawnej okładki; zachowano źródło.",
+        "metadata_failed": "Nie udało się odczytać metadanych źródła; zachowano źródło.",
+        "output_changed": "Wynik zmienił się lub zniknął po konwersji; zachowano źródło.",
+        "cover_changed": "Okładka zmieniła się lub zniknęła po konwersji; zachowano źródło.",
     },
 }
 
@@ -318,6 +332,10 @@ class ConversionResult:
     status: str  # "ok" | "skipped" | "failed"
     audio_duration: float = 0.0
     error: str = ""
+    source_signature: tuple[int, int, int, int, int] | None = None
+    output_signature: tuple[int, int, int, int, int] | None = None
+    cover_path: Path | None = None
+    cover_signature: tuple[int, int, int, int, int] | None = None
 
     # Backward-compat aliases (old field name was mp3_bytes)
     @property
@@ -397,7 +415,9 @@ class FileInfo:
     path: Path
     duration: float = 0.0      # seconds
     channels: int = 0          # 1=mono, 2=stereo, 0=unknown
-    has_cover: bool = False
+    has_cover: bool | None = None  # None means metadata inspection failed.
+    source_signature: tuple[int, int, int, int, int] | None = None
+    probe_error: str = ""
 
 
 def fmt_duration(seconds: float) -> str:
@@ -725,17 +745,32 @@ def ffprobe_duration(file: Path, ffprobe: str) -> float:
         return 0.0
 
 
-def get_file_metadata(file: Path, ffprobe: str) -> tuple[float, int, bool]:
-    """Single probe for duration, channel count, and cover art presence."""
+def _audio_stream_duration(stream: dict) -> float:
+    """Read stream duration in seconds, falling back to timestamps and time base."""
+    try:
+        duration = float(stream.get("duration", 0))
+        if math.isfinite(duration) and duration > 0:
+            return duration
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        duration = float(int(stream.get("duration_ts", 0)) * Fraction(stream.get("time_base", "0")))
+        return duration if math.isfinite(duration) and duration > 0 else 0.0
+    except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+        return 0.0
+
+
+def get_file_metadata(file: Path, ffprobe: str) -> tuple[float, int, bool | None]:
+    """Probe the first audio stream, falling back to container duration if absent."""
     if not ffprobe:
-        return 0.0, 0, False
+        return 0.0, 0, None
     try:
         out = subprocess.check_output(
             [
                 ffprobe, "-v", "error",
                 "-print_format", "json",
                 "-show_entries", "format=duration",
-                "-show_entries", "stream=channels,codec_type",
+                "-show_entries", "stream=channels,codec_type,duration,duration_ts,time_base",
                 str(file),
             ],
             stderr=subprocess.DEVNULL, text=True, timeout=10,
@@ -748,43 +783,75 @@ def get_file_metadata(file: Path, ffprobe: str) -> tuple[float, int, bool]:
         if not math.isfinite(duration) or duration < 0:
             duration = 0.0
 
-        channels = 0
-        has_cover = False
-        for stream in data.get("streams", []):
-            ctype = stream.get("codec_type")
-            if ctype == "audio" and channels == 0:
-                # First audio stream wins (ffprobe a:0 semantics).
-                try:
-                    channels = int(stream.get("channels", 0))
-                except (TypeError, ValueError):
-                    channels = 0
-            elif ctype == "video":
-                has_cover = True
+        streams = data.get("streams", [])
+        # Match the encoder's explicit -map 0:a:0, including unknown channels.
+        audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), {})
+        if not audio:
+            return duration, 0, None
+        try:
+            channels = int(audio.get("channels", 0))
+        except (TypeError, ValueError):
+            channels = 0
+        stream_duration = _audio_stream_duration(audio)
+        if stream_duration > 0:
+            duration = stream_duration
+        has_cover = any(stream.get("codec_type") == "video" for stream in streams)
         return duration, channels, has_cover
     except Exception:
-        return 0.0, 0, False
+        return 0.0, 0, None
+
+
+def _valid_cover(cover_path: Path, ffmpeg: str) -> bool:
+    """Verify that a sidecar contains an image FFmpeg can actually decode."""
+    try:
+        if not cover_path.is_file() or cover_path.stat().st_size == 0:
+            return False
+        result = subprocess.run(
+            [ffmpeg, "-nostdin", "-v", "error", "-xerror", "-i", str(cover_path),
+             "-map", "0:v:0", "-frames:v", "1", "-f", "null", "-"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, timeout=30,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def extract_cover(file: Path, cover_path: Path, ffmpeg: str) -> bool:
     """Extracts embedded cover to sidecar cover.jpg (always real JPEG)."""
+    temporary = None
     try:
+        fd, name = tempfile.mkstemp(prefix=".cover.", suffix=".jpg", dir=cover_path.parent)
+        os.close(fd)
+        temporary = Path(name)
         r = subprocess.run(
             [
-                ffmpeg, "-y", "-loglevel", "error",
+                ffmpeg, "-nostdin", "-y", "-loglevel", "error",
                 "-i", str(file),
                 "-map", "0:v:0?",
                 "-c:v", "mjpeg",
                 "-q:v", "2",
                 "-frames:v", "1",
-                str(cover_path),
+                str(temporary),
             ],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             timeout=30,
         )
-        return r.returncode == 0 and cover_path.exists() and cover_path.stat().st_size > 0
+        if r.returncode != 0 or not _valid_cover(temporary, ffmpeg):
+            return False
+        try:
+            temporary.chmod(file.stat().st_mode & 0o666)
+        except OSError:
+            pass
+        os.replace(temporary, cover_path)
+        return True
     except Exception:
         return False
+    finally:
+        if temporary is not None:
+            _safe_unlink(temporary)
 
 
 def _safe_unlink(path: Path) -> None:
@@ -796,29 +863,135 @@ def _safe_unlink(path: Path) -> None:
         pass
 
 
-def _publish_output(temp_out: Path, out: Path, force: bool) -> None:
+def _publish_output(temp_out: Path, out: Path, force: bool) -> tuple[int, int, int, int, int]:
+    expected = temp_out.stat()
     if force:
         os.replace(temp_out, out)
-        return
-    try:
-        os.link(temp_out, out)
-    except OSError as error:
-        if error.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV, errno.ENOSYS):
-            raise
-        # FAT and some network mounts do not support hard links. Exclusive
-        # creation still prevents overwriting another conversion's output.
-        with temp_out.open("rb") as source, out.open("xb") as target:
-            try:
-                shutil.copyfileobj(source, target)
-                target.flush()
-            except BaseException:
-                target.close()
-                _safe_unlink(out)
+    else:
+        try:
+            os.link(temp_out, out)
+        except OSError as error:
+            if error.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV, errno.ENOSYS):
                 raise
+            # FAT and some network mounts do not support hard links. Exclusive
+            # creation still prevents overwriting another conversion's output.
+            with temp_out.open("rb") as source:
+                mode = os.fstat(source.fileno()).st_mode & 0o777
+                # Apply permissions at creation, so private audio is never exposed
+                # through the process's more permissive default umask.
+                with open(out, "xb", opener=lambda path, flags: os.open(path, flags, mode)) as target:
+                    try:
+                        shutil.copyfileobj(source, target)
+                        target.flush()
+                        expected = os.fstat(target.fileno())
+                    except BaseException:
+                        target.close()
+                        _safe_unlink(out)
+                        raise
     _safe_unlink(temp_out)
+    published = out.stat()
+    # Record the file we created, rather than a replacement raced into its path.
+    # Linking/renaming changes ctime; fallback copying creates a new inode.
+    if (published.st_dev, published.st_ino, published.st_size) != (
+        expected.st_dev, expected.st_ino, expected.st_size,
+    ):
+        raise OSError(t("output_changed"))
+    return _stat_signature(published)
 
 
 # ── Konwersja / Conversion ─────────────────────────────────────────────────
+
+def _stat_signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    """Detect replacement and in-place edits, including ones preserving mtime."""
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _probe_file(file: Path, ffprobe: str) -> FileInfo:
+    """Bind metadata to a source version before it enters the encoding queue."""
+    info = FileInfo(path=file)
+    try:
+        info.source_signature = _stat_signature(file.stat())
+        info.duration, info.channels, info.has_cover = get_file_metadata(file, ffprobe)
+        if _stat_signature(file.stat()) != info.source_signature:
+            info.probe_error = t("source_changed")
+        elif info.has_cover is None:
+            info.probe_error = t("metadata_failed")
+    except OSError as error:
+        info.probe_error = str(error)
+    return info
+
+
+def _check_signature(path: Path, expected: tuple | None, message: str) -> tuple:
+    try:
+        current = _stat_signature(path.stat())
+    except OSError as error:
+        raise OSError(t(message)) from error
+    if expected is None or current != expected:
+        raise OSError(t(message))
+    return current
+
+
+def _cover_signature(path: Path, ffmpeg: str) -> tuple | None:
+    """Only cache a cover if it stayed unchanged while being decoded."""
+    try:
+        before = _stat_signature(path.stat())
+        if _valid_cover(path, ffmpeg) and _stat_signature(path.stat()) == before:
+            return before
+    except OSError:
+        pass
+    return None
+
+
+def _source_digest(path: Path, expected: tuple) -> str:
+    """Hash a stable source for batches containing multiple hardlink names."""
+    with path.open("rb") as source:
+        before = _stat_signature(os.fstat(source.fileno()))
+        if before != expected:
+            raise OSError(t("source_changed"))
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if _stat_signature(os.fstat(source.fileno())) != before:
+            raise OSError(t("source_changed"))
+    _check_signature(path, before, "source_changed")
+    return digest.hexdigest()
+
+
+def _delete_converted_sources(results: list[ConversionResult]) -> tuple[int, int]:
+    """Verify all retained artifacts and account for our own hardlink unlinks."""
+    group_sizes: dict[tuple, int] = {}
+    for result in results:
+        key = result.source_signature[:2] if result.source_signature is not None else None
+        if key is not None:
+            group_sizes[key] = group_sizes.get(key, 0) + 1
+    digests: dict[tuple, str] = {}
+    unlinked: set[tuple] = set()
+    deleted = failed = 0
+    for result in results:
+        try:
+            expected = result.source_signature
+            current = _stat_signature(result.source.stat())
+            if expected is None:
+                raise OSError(t("source_changed"))
+            key = expected[:2]
+            if current != expected:
+                if (key not in unlinked or current[:4] != expected[:4]
+                        or _source_digest(result.source, current) != digests[key]):
+                    raise OSError(t("source_changed"))
+            if group_sizes[key] > 1 and key not in digests:
+                digests[key] = _source_digest(result.source, current)
+            _check_signature(result.output, result.output_signature, "output_changed")
+            if result.cover_path is not None:
+                _check_signature(result.cover_path, result.cover_signature, "cover_changed")
+            _check_signature(result.source, current, "source_changed")
+            result.source.unlink()
+            unlinked.add(key)
+            deleted += 1
+        except OSError as error:
+            console.print(t("delete_error", name=escape(result.name), err=escape(str(error))))
+            failed += 1
+    return deleted, failed
+
 
 def convert_file(
     file: Path,
@@ -831,13 +1004,18 @@ def convert_file(
     inner_task_id=None,
     outer_task_id=None,
     dry_run: bool = False,
-    extracted_covers: set[Path] | None = None,
+    extracted_covers: dict[Path, tuple] | None = None,
     cover_lock: threading.Lock | None = None,
     cancel_event: threading.Event | None = None,
+    has_cover: bool | None = False,
+    expected_source_signature: tuple | None = None,
+    probe_error: str = "",
 ) -> ConversionResult:
     out = file.with_suffix(".opus")
     try:
-        src_bytes = file.stat().st_size
+        source_stat = file.stat()
+        source_signature = _stat_signature(source_stat)
+        src_bytes = source_stat.st_size
     except OSError as e:
         return ConversionResult(
             name=file.name,
@@ -869,6 +1047,17 @@ def convert_file(
             audio_duration=duration,
         )
 
+    error = probe_error
+    if not error and expected_source_signature is not None and source_signature != expected_source_signature:
+        error = t("source_changed")
+    if not error and has_cover is None:
+        error = t("metadata_failed")
+    if error:
+        return ConversionResult(
+            name=file.name, source=file, output=out, src_bytes=src_bytes, opus_bytes=0,
+            duration_s=0, status="failed", audio_duration=duration, error=error,
+        )
+
     args = [
         ffmpeg,
         "-i", str(file),
@@ -886,7 +1075,7 @@ def convert_file(
     ]
 
     if dry_run:
-        console.print(f"  [dim]DRY:[/] {' '.join(args)}")
+        console.print(f"  [dim]DRY:[/] {escape(' '.join(args))}")
         if progress is not None and outer_task_id is not None and duration > 0:
             progress.advance(outer_task_id, duration)
         return ConversionResult(
@@ -933,7 +1122,7 @@ def convert_file(
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("conversion cancelled")
         # Keep the previous output intact until encoding and validation succeed.
-        fd, temp_name = tempfile.mkstemp(prefix=f".{out.stem}.", suffix=".opus", dir=out.parent)
+        fd, temp_name = tempfile.mkstemp(prefix=".opusbook.", suffix=".opus", dir=out.parent)
         os.close(fd)
         temp_out = Path(temp_name)
         args[-1] = str(temp_out)
@@ -1003,8 +1192,14 @@ def convert_file(
 
         opus_bytes = temp_out.stat().st_size
         out_dur = ffprobe_duration(temp_out, ffprobe)
-        if opus_bytes == 0 or out_dur <= 0 or (duration > 0 and abs(out_dur - duration) / duration > 0.05):
-            err = (f"output duration {out_dur:.1f}s != source {duration:.1f}s"
+        # Allow up to 20 ms of extra duration for codec delay on short clips.
+        # Keep the relative truncation check even for these short inputs.
+        duration_mismatch = duration > 0 and (
+            duration - out_dur > duration * 0.05
+            or out_dur - duration > max(0.02, duration * 0.05)
+        )
+        if opus_bytes == 0 or out_dur <= 0 or duration_mismatch:
+            err = (f"output duration {out_dur:.3f}s != source {duration:.3f}s"
                    if out_dur else "output has no audio stream")
             _safe_unlink(temp_out)
             return ConversionResult(
@@ -1019,29 +1214,44 @@ def convert_file(
                 error=err,
             )
 
+        if _stat_signature(file.stat()) != source_signature:
+            raise RuntimeError(t("source_changed"))
+
+        # Export covers before publishing audio, so a failed export keeps both
+        # the source and any previous Opus output available for a retry.
+        cover_path = None
+        cover_signature = None
+        if has_cover:
+            cover_path = file.parent / "cover.jpg"
+            known_covers = extracted_covers if extracted_covers is not None else {}
+            with (cover_lock if cover_lock is not None else nullcontext()):
+                try:
+                    cover_signature = _stat_signature(cover_path.stat())
+                except OSError:
+                    cover_signature = None
+                if cover_signature is None or known_covers.get(cover_path) != cover_signature:
+                    cover_signature = _cover_signature(cover_path, ffmpeg)
+                    if cover_signature is None:
+                        if not extract_cover(file, cover_path, ffmpeg):
+                            raise RuntimeError(t("cover_export_failed"))
+                        cover_signature = _cover_signature(cover_path, ffmpeg)
+                    if cover_signature is None:
+                        raise RuntimeError(t("cover_export_failed"))
+                    known_covers[cover_path] = cover_signature
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("conversion cancelled")
+        if _stat_signature(file.stat()) != source_signature:
+            raise RuntimeError(t("source_changed"))
+
         # mkstemp uses 0600; keep media readable wherever the source was readable.
-        mode = out.stat().st_mode & 0o777 if force and out.exists() else file.stat().st_mode & 0o666
+        mode = out.stat().st_mode & 0o777 if force and out.exists() else source_stat.st_mode & 0o666
         try:
             temp_out.chmod(mode)
         except OSError:
             # Some filesystems and network mounts do not support POSIX permissions.
             pass
-        _publish_output(temp_out, out, force)
-
-        if extracted_covers is not None:
-            cover_path = file.parent / "cover.jpg"
-            if cover_lock is not None:
-                with cover_lock:
-                    if cover_path not in extracted_covers:
-                        if cover_path.exists():
-                            extracted_covers.add(cover_path)
-                        elif extract_cover(file, cover_path, ffmpeg):
-                            extracted_covers.add(cover_path)
-            elif cover_path not in extracted_covers:
-                if cover_path.exists():
-                    extracted_covers.add(cover_path)
-                elif extract_cover(file, cover_path, ffmpeg):
-                    extracted_covers.add(cover_path)
+        output_signature = _publish_output(temp_out, out, force)
 
         return ConversionResult(
             name=file.name,
@@ -1052,6 +1262,10 @@ def convert_file(
             duration_s=duration_s,
             status="ok",
             audio_duration=duration,
+            source_signature=source_signature,
+            output_signature=output_signature,
+            cover_path=cover_path,
+            cover_signature=cover_signature,
         )
 
     except BaseException as e:
@@ -1139,7 +1353,7 @@ def build_result_table(stats: Stats, max_rows: int = 30, base_dir: Path | None =
         else:
             saved_cell = saved
         table.add_row(
-            _display_name(r, base_dir),
+            Text(_display_name(r, base_dir)),
             fmt_mb(r.src_mb),
             fmt_mb(r.opus_mb),
             saved_cell,
@@ -1151,7 +1365,7 @@ def build_result_table(stats: Stats, max_rows: int = 30, base_dir: Path | None =
 
     for r in stats.skipped:
         table.add_row(
-            _display_name(r, base_dir),
+            Text(_display_name(r, base_dir)),
             fmt_mb(r.src_mb),
             "[dim]—[/]",
             "[dim]—[/]",
@@ -1163,7 +1377,7 @@ def build_result_table(stats: Stats, max_rows: int = 30, base_dir: Path | None =
 
     for r in stats.failed:
         table.add_row(
-            _display_name(r, base_dir),
+            Text(_display_name(r, base_dir)),
             fmt_mb(r.src_mb),
             "[dim]—[/]",
             "[dim]—[/]",
@@ -1208,7 +1422,7 @@ def build_summary_panel(stats: Stats, bitrate: str) -> Panel:
         lines += ["", t("summary_failed_hdr")]
         for r in stats.failed:
             err_short = r.error[:80] + "…" if len(r.error) > 80 else r.error
-            lines.append(f"    [red]• {r.name}[/] — [dim]{err_short}[/]")
+            lines.append(f"    [red]• {escape(r.name)}[/] - [dim]{escape(err_short)}[/]")
 
     return Panel(
         "\n".join(lines),
@@ -1343,7 +1557,7 @@ def main(argv: list[str] | None = None):
 
     # Bitrate validation
     if not re.match(r"^\d{1,4}[kM]$", args.bitrate):
-        console.print(t("invalid_bitrate", bitrate=args.bitrate))
+        console.print(t("invalid_bitrate", bitrate=escape(repr(args.bitrate))))
         sys.exit(1)
 
     try:
@@ -1359,7 +1573,7 @@ def main(argv: list[str] | None = None):
 
     root = Path(args.path).resolve()
     if not root.exists():
-        console.print(t("path_not_found", path=root))
+        console.print(t("path_not_found", path=escape(str(root))))
         sys.exit(1)
 
     # ── ffmpeg + ffprobe ──
@@ -1378,8 +1592,8 @@ def main(argv: list[str] | None = None):
     # Skip ffprobe hard requirement for pure dry-run without metadata? No —
     # dry-run still needs durations for planning, keep requirement.
     console.print(
-        f"  [dim]ffmpeg {ffver} → {ffmpeg}[/]\n"
-        f"  [dim]ffprobe → {ffprobe}[/]\n"
+        f"  [dim]ffmpeg {escape(ffver)} → {escape(ffmpeg)}[/]\n"
+        f"  [dim]ffprobe → {escape(ffprobe)}[/]\n"
     )
 
     # ── Skanowanie plików / Scanning ──
@@ -1390,7 +1604,7 @@ def main(argv: list[str] | None = None):
             if root.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
                 raw_files = [root]
             else:
-                console.print(t("unsupported_file", path=root))
+                console.print(t("unsupported_file", path=escape(str(root))))
                 sys.exit(1)
             scan_base = root.parent
         elif root.is_dir():
@@ -1404,13 +1618,13 @@ def main(argv: list[str] | None = None):
                     [p for p in root.glob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS]
                 )
         else:
-            console.print(t("path_not_found", path=root))
+            console.print(t("path_not_found", path=escape(str(root))))
             sys.exit(1)
 
     if not raw_files:
         console.print(
             Panel(
-                t("no_audio_files", exts=', '.join(sorted(SUPPORTED_AUDIO_EXTENSIONS)), path=root),
+                t("no_audio_files", exts=', '.join(sorted(SUPPORTED_AUDIO_EXTENSIONS)), path=escape(str(root))),
                 border_style="yellow",
             )
         )
@@ -1420,7 +1634,7 @@ def main(argv: list[str] | None = None):
     for source in raw_files:
         output = source.with_suffix(".opus")
         if output in outputs:
-            console.print(t("output_collision", path=output))
+            console.print(t("output_collision", path=escape(str(output))))
             sys.exit(1)
         outputs.add(output)
 
@@ -1429,12 +1643,11 @@ def main(argv: list[str] | None = None):
     try:
         with console.status(t("probing_metadata"), spinner="dots") as status:
             def get_meta(p):
-                duration, channels, has_cover = get_file_metadata(p, ffprobe)
-                return FileInfo(path=p, duration=duration, channels=channels, has_cover=has_cover)
+                return _probe_file(p, ffprobe)
 
             with ThreadPoolExecutor(max_workers=min(16, (os.cpu_count() or 1) * 2)) as executor:
                 for i, info in enumerate(executor.map(get_meta, raw_files), 1):
-                    status.update(t("probing_status", i=i, total=len(raw_files), name=info.path.name[:30]))
+                    status.update(t("probing_status", i=i, total=len(raw_files), name=escape(info.path.name[:30])))
                     file_infos.append(info)
     except KeyboardInterrupt:
         console.print(t("aborted"))
@@ -1445,7 +1658,7 @@ def main(argv: list[str] | None = None):
             return p.stat().st_size
         except OSError:
             try:
-                console.print(t("stat_error", path=p))
+                console.print(t("stat_error", path=escape(str(p))))
             except Exception:
                 pass
             return 0
@@ -1460,7 +1673,7 @@ def main(argv: list[str] | None = None):
     no_str = t("no")
     header_line = (
         f"{t('header_title')}\n"
-        f"[dim]{t('header_dir')}[/] [white]{root}[/]  "
+        f"[dim]{t('header_dir')}[/] [white]{escape(str(root))}[/]  "
         f"[dim]{t('header_bitrate')}[/] [yellow]{args.bitrate}[/]  "
         f"[dim]{t('header_jobs')}[/] [yellow]{args.jobs}[/]  "
         f"[dim]{t('header_auto')}[/] {'[green]' + yes_str + '[/]' if args.auto else '[dim]' + no_str + '[/]'}  "
@@ -1478,7 +1691,7 @@ def main(argv: list[str] | None = None):
     console.print(Panel.fit(header_line, border_style="cyan"))
 
     stats = Stats()
-    extracted_covers: set[Path] = set()
+    extracted_covers: dict[Path, tuple] = {}
     cover_lock = threading.Lock()
     stats_lock = threading.Lock()
     cancel_event = threading.Event()
@@ -1502,6 +1715,9 @@ def main(argv: list[str] | None = None):
                 dry_run=True,
                 extracted_covers=None,
                 cover_lock=None,
+                has_cover=info.has_cover,
+                expected_source_signature=info.source_signature,
+                probe_error=info.probe_error,
             )
             with stats_lock:
                 stats.results.append(result)
@@ -1511,6 +1727,8 @@ def main(argv: list[str] | None = None):
         console.print()
         console.print(build_summary_panel(stats, args.bitrate))
         console.print()
+        if stats.failed:
+            sys.exit(1)
         return
 
     # ── Pasek postępu / Progress bar ──
@@ -1552,6 +1770,9 @@ def main(argv: list[str] | None = None):
             extracted_covers=extracted_covers,
             cover_lock=cover_lock,
             cancel_event=cancel_event,
+            has_cover=info.has_cover,
+            expected_source_signature=info.source_signature,
+            probe_error=info.probe_error,
         )
         with stats_lock:
             stats.results.append(result)
@@ -1570,7 +1791,7 @@ def main(argv: list[str] | None = None):
                         if args.auto and info.channels == 1 else ""
                     )
                     inner = progress.add_task(
-                        f"  [cyan]└─ {info.path.name[:42]}[/]" + suffix,
+                        f"  [cyan]└─ {escape(info.path.name[:42])}[/]" + suffix,
                         total=max(info.duration, 0.001),
                     )
                     fut = executor.submit(convert_worker, info, inner)
@@ -1660,15 +1881,8 @@ def main(argv: list[str] | None = None):
                 do_delete = False
 
         if do_delete:
-            deleted, failed_del = 0, 0
             with console.status(t("deleting_status"), spinner="dots"):
-                for r in stats.converted:
-                    try:
-                        r.source.unlink()
-                        deleted += 1
-                    except Exception as e:
-                        console.print(t("delete_error", name=r.name, err=e))
-                        failed_del += 1
+                deleted, failed_del = _delete_converted_sources(stats.converted)
             err_msg = t("deleted_errors", count=failed_del) if failed_del else ""
             console.print(t("deleted_success", count=deleted) + err_msg)
         else:

@@ -1,7 +1,8 @@
 # 🎵 opusbook
 
-> 🎧 **EN:** Fast, multi-threaded audio-to-Opus converter for audiobooks, radio plays, and podcasts. Typical storage savings: **~60–75%** for lossy sources (MP3/M4B 128k → Opus 64k) and up to **~90%** for lossless (FLAC/WAV → Opus) with transparent speech quality.  
-> 🇵🇱 **PL:** Szybki, wielowątkowy konwerter audio do formatu Opus dla audiobooków, słuchowisk i podcastów. Typowa oszczędność miejsca: **~60–75%** dla źródeł stratnych (MP3/M4B 128k → Opus 64k) oraz do **~90%** dla bezstratnych (FLAC/WAV → Opus) przy zachowaniu czystej jakości głosu.
+> 🎧 **EN:** Convert audiobooks, radio plays, and podcasts to Opus from the terminal.
+>
+> 🇵🇱 **PL:** Konwertuj audiobooki, słuchowiska i podcasty do Opus z terminala.
 
 [ 🇬🇧 English ](#-english) • [ 🇵🇱 Polski ](#-polski)
 
@@ -93,6 +94,7 @@ opusbook audiobooks/ -r -b 64k --dry-run
 > **Exit codes & safety notes:**  
 > - `--keep` and `--delete` are mutually exclusive. If neither is passed, `opusbook` asks at the end of an interactive session (or keeps originals in non-TTY scripts).  
 > - Any conversion or deletion error returns exit code `1`. Pressing `Ctrl+C` cleanly terminates active `ffmpeg` workers, removes partial temporary files, and exits with code `130`.
+> - Metadata is tied to the source version from the start of inspection. Source identity, size, and timestamps are checked again before encoding, publishing output, and deleting originals. Before deletion, the program also checks that the Opus output and any required cover are still present and unchanged. Detected changes keep the source and return exit code `1`. Metadata inspection or embedded cover export failures also keep the source and any previous `.opus` output; empty or invalid `cover.jpg` files are replaced only after a valid image has been exported. Hardlinked inputs are supported; removing one name does not invalidate the others.
 
 ### 🆘 Troubleshooting
 
@@ -201,6 +203,7 @@ opusbook audiobooki/ -r -b 64k --dry-run
 > **Kody wyjścia i bezpieczeństwo:**  
 > - Flagi `--keep` oraz `--delete` wykluczają się wzajemnie. Jeśli nie podasz żadnej z nich, w terminalu program zapyta na końcu o usunięcie oryginałów (a w skryptach cron/CI domyślnie je zachowa).  
 > - Błąd konwersji lub usuwania zwraca kod wyjścia `1`. Naciśnięcie `Ctrl+C` bezpiecznie zatrzymuje procesy `ffmpeg`, usuwa niedokończone pliki tymczasowe i kończy program z kodem `130`.
+> - Metadane są powiązane z wersją źródła od rozpoczęcia odczytu. Przed kodowaniem, publikacją wyniku i usunięciem oryginału program ponownie sprawdza tożsamość, rozmiar i znaczniki czasu źródła. Przed usunięciem sprawdza też, czy wynik Opus oraz wymagana okładka nadal istnieją i nie zostały zmienione. Wykryta zmiana oznacza zachowanie źródła i kod wyjścia `1`. Błąd odczytu metadanych lub eksportu osadzonej okładki również zachowuje źródło oraz wcześniejszy plik `.opus`; pusty lub niepoprawny `cover.jpg` jest zastępowany dopiero po zapisaniu poprawnego obrazu. Obsługiwane są też hardlinki: usunięcie jednej nazwy nie powoduje błędnego odrzucenia pozostałych.
 
 ### 🆘 Rozwiązywanie problemów
 
