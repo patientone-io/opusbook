@@ -34,6 +34,44 @@ A command-line tool that converts audio files (**MP3, M4B, M4A, FLAC, AAC, WAV, 
 
 ### 🚀 Installation
 
+#### Windows: portable ZIP (Windows 10/11 x64)
+
+Download `opusbook-1.1.1-windows-x64.zip` from [Releases](https://github.com/patientone-io/opusbook/releases/tag/v1.1.1)
+and extract the entire ZIP to a normal folder. Python, FFmpeg and ffprobe
+are included; no installation or PATH changes are needed.
+
+Drag **one folder or audio file** onto `opusbook.exe`, or double-click it and
+paste a full path. Choose the bitrate with the arrow keys. This mode searches
+subfolders and **keeps originals**; results are saved beside the sources.
+Press Enter at the end to close the window. Keep the entire extracted folder,
+including `_internal`, `ffmpeg.exe` and `ffprobe.exe`.
+
+For the regular CLI, open PowerShell in the extracted folder:
+
+```powershell
+.\opusbook.exe "D:\Audiobooks" -r -b 64k --keep
+```
+
+For build details and validation status, see [Portable packaging](packaging/README.md).
+
+#### Linux: portable archive (x86_64, glibc 2.41+)
+
+Built on **Debian 13** with bundled Python, FFmpeg and their libraries.
+Download `opusbook-1.1.1-linux-x64.tar.gz` and its `.sha256` file from
+[Releases](https://github.com/patientone-io/opusbook/releases/tag/v1.1.1):
+
+```bash
+sha256sum -c opusbook-1.1.1-linux-x64.tar.gz.sha256
+tar -xzf opusbook-1.1.1-linux-x64.tar.gz
+./opusbook/opusbook "/path/to/audiobooks" -r -b 64k --keep
+```
+
+Keep the entire extracted folder together. Outputs are saved beside the sources;
+`--keep` preserves originals. Requires glibc 2.41 or newer; Alpine/musl and
+older distributions need the Python installation below.
+
+#### Python installation (Linux, macOS, Windows)
+
 **Requirements:** **Python 3.10+** and **FFmpeg** (with `libopus` and `ffprobe`) available on your `PATH`. You can verify `libopus` support with `ffmpeg -encoders | grep opus`.
 
 #### Option 1: Global CLI via `pipx` or `uv` (Recommended)
@@ -94,7 +132,7 @@ opusbook audiobooks/ -r -b 64k --dry-run
 > **Exit codes & safety notes:**  
 > - `--keep` and `--delete` are mutually exclusive. If neither is passed, `opusbook` asks at the end of an interactive session (or keeps originals in non-TTY scripts).  
 > - Any conversion or deletion error returns exit code `1`. Pressing `Ctrl+C` cleanly terminates active `ffmpeg` workers, removes partial temporary files, and exits with code `130`.
-> - Metadata is tied to the source version from the start of inspection. Source identity, size, and timestamps are checked again before encoding, publishing output, and deleting originals. Before deletion, the program also checks that the Opus output and any required cover are still present and unchanged. Detected changes keep the source and return exit code `1`. Metadata inspection or embedded cover export failures also keep the source and any previous `.opus` output; empty or invalid `cover.jpg` files are replaced only after a valid image has been exported. Hardlinked inputs are supported; removing one name does not invalidate the others.
+> - Metadata is tied to the source version from the start of inspection. Source identity, size, and timestamps are checked again before encoding, publishing output, and deleting originals. Before deletion, the program also checks that the Opus output and any required cover are still present and unchanged. Detected changes keep the source and return exit code `1`. Metadata inspection or embedded cover export failures also keep the source and any previous `.opus` output; empty or invalid `cover.jpg` files are replaced only after a valid image has been exported. Hardlinked inputs are supported; removing one name does not invalidate the others. On Windows, these checks also read and hash the complete files to detect changes hidden by timestamp granularity; this adds disk reads.
 
 ### 🆘 Troubleshooting
 
@@ -142,6 +180,44 @@ Narzędzie wiersza poleceń konwertujące pliki audio (**MP3, M4B, M4A, FLAC, AA
 - 🤖 **Gotowy do skryptów i crona** — uruchomiony bez interaktywnego terminala (brak TTY) automatycznie przyjmuje `64k` i zachowuje pliki źródłowe.
 
 ### 🚀 Instalacja
+
+#### Windows: przenośny ZIP (Windows 10/11 x64)
+
+Pobierz `opusbook-1.1.1-windows-x64.zip` z [Releases](https://github.com/patientone-io/opusbook/releases/tag/v1.1.1)
+i rozpakuj cały ZIP do zwykłego folderu. Python, FFmpeg i ffprobe są dołączone;
+instalacja ani zmiany w PATH nie są potrzebne.
+
+Przeciągnij **jeden folder lub plik audio** na `opusbook.exe` albo uruchom
+program dwuklikiem i wklej pełną ścieżkę. Wybierz jakość strzałkami. Ten tryb
+przeszukuje podkatalogi i **zachowuje oryginały**; wyniki zapisuje obok źródeł.
+Na końcu Enter zamyka okno. Zachowaj cały rozpakowany folder, w tym `_internal`,
+`ffmpeg.exe` i `ffprobe.exe`.
+
+Pełny interfejs CLI jest dostępny w PowerShellu otwartym w folderze programu:
+
+```powershell
+.\opusbook.exe "D:\Audiobooki" -r -b 64k --keep
+```
+
+Budowanie i zakres walidacji opisuje [instrukcja pakowania](packaging/README.md).
+
+#### Linux: przenośne archiwum (x86_64, glibc 2.41+)
+
+Build na **Debianie 13**, z dołączonym Pythonem, FFmpeg i ich bibliotekami.
+Pobierz `opusbook-1.1.1-linux-x64.tar.gz` oraz plik `.sha256` z
+[Releases](https://github.com/patientone-io/opusbook/releases/tag/v1.1.1):
+
+```bash
+sha256sum -c opusbook-1.1.1-linux-x64.tar.gz.sha256
+tar -xzf opusbook-1.1.1-linux-x64.tar.gz
+./opusbook/opusbook "/ścieżka/do/audiobooków" -r -b 64k --keep
+```
+
+Zachowaj cały rozpakowany folder. Wyniki powstają obok źródeł;
+`--keep` zachowuje oryginały. Wymagana glibc 2.41 lub nowsza. Na Alpine/musl
+oraz starszych dystrybucjach skorzystaj z instalacji przez Python poniżej.
+
+#### Instalacja przez Python (Linux, macOS, Windows)
 
 **Wymagania:** **Python 3.10+** oraz zainstalowany w systemie pakiet **FFmpeg** (zawierający koder `libopus` i narzędzie `ffprobe`). Obecność kodera sprawdzisz poleceniem `ffmpeg -encoders | grep opus`.
 
@@ -203,7 +279,7 @@ opusbook audiobooki/ -r -b 64k --dry-run
 > **Kody wyjścia i bezpieczeństwo:**  
 > - Flagi `--keep` oraz `--delete` wykluczają się wzajemnie. Jeśli nie podasz żadnej z nich, w terminalu program zapyta na końcu o usunięcie oryginałów (a w skryptach cron/CI domyślnie je zachowa).  
 > - Błąd konwersji lub usuwania zwraca kod wyjścia `1`. Naciśnięcie `Ctrl+C` bezpiecznie zatrzymuje procesy `ffmpeg`, usuwa niedokończone pliki tymczasowe i kończy program z kodem `130`.
-> - Metadane są powiązane z wersją źródła od rozpoczęcia odczytu. Przed kodowaniem, publikacją wyniku i usunięciem oryginału program ponownie sprawdza tożsamość, rozmiar i znaczniki czasu źródła. Przed usunięciem sprawdza też, czy wynik Opus oraz wymagana okładka nadal istnieją i nie zostały zmienione. Wykryta zmiana oznacza zachowanie źródła i kod wyjścia `1`. Błąd odczytu metadanych lub eksportu osadzonej okładki również zachowuje źródło oraz wcześniejszy plik `.opus`; pusty lub niepoprawny `cover.jpg` jest zastępowany dopiero po zapisaniu poprawnego obrazu. Obsługiwane są też hardlinki: usunięcie jednej nazwy nie powoduje błędnego odrzucenia pozostałych.
+> - Metadane są powiązane z wersją źródła od rozpoczęcia odczytu. Przed kodowaniem, publikacją wyniku i usunięciem oryginału program ponownie sprawdza tożsamość, rozmiar i znaczniki czasu źródła. Przed usunięciem sprawdza też, czy wynik Opus oraz wymagana okładka nadal istnieją i nie zostały zmienione. Wykryta zmiana oznacza zachowanie źródła i kod wyjścia `1`. Błąd odczytu metadanych lub eksportu osadzonej okładki również zachowuje źródło oraz wcześniejszy plik `.opus`; pusty lub niepoprawny `cover.jpg` jest zastępowany dopiero po zapisaniu poprawnego obrazu. Obsługiwane są też hardlinki: usunięcie jednej nazwy nie powoduje błędnego odrzucenia pozostałych. Na Windows kontrole dodatkowo odczytują i haszują całe pliki, aby wykrywać zmiany niewidoczne w znacznikach czasu; oznacza to dodatkowe odczyty z dysku.
 
 ### 🆘 Rozwiązywanie problemów
 

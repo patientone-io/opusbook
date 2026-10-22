@@ -16,11 +16,27 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
+      - name: Ensure patched Node 24 for JavaScript actions
+        shell: bash
+        run: |
+          set -euo pipefail
+          worker_pid=$(pgrep -xo Runner.Worker)
+          runner=$(dirname "$(dirname "$(readlink -f "/proc/$worker_pid/exe")")")
+          node="$runner/externals/node24/bin/node"
+          current=$("$node" --version)
+          if [ "$(printf '%s\n' '24.22.1' "${current#v}" | sort -V | head -n 1)" != '24.22.1' ]; then
+            archive="$RUNNER_TEMP/node-v24.22.1-linux-x64.tar.xz"
+            curl --fail --location --retry 3 https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz -o "$archive"
+            printf '%s  %s\n' '6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6' "$archive" | sha256sum -c -
+            tar -xJf "$archive" -C "$RUNNER_TEMP" node-v24.22.1-linux-x64/bin/node
+            sudo install -m 755 "$RUNNER_TEMP/node-v24.22.1-linux-x64/bin/node" "$node"
+          fi
+          "$node" --version
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
 

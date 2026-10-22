@@ -5,9 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.1 portable] - 2026-10-22
+
+Portable packages include the changes below. The historical `v1.1.1` tag remains unchanged;
+the Release notes and portable-source archive identify the packaged revision.
+
+### Added
+- Linux x64 portable archive built on Debian 13 (glibc 2.41+), with bundled Python, FFmpeg, native libraries and executable smoke tests.
+- Windows x64 portable ZIP build with bundled Python, FFmpeg and ffprobe, verified FFmpeg download, checksums and Windows CI smoke tests.
+- Double-click and single-item drag-and-drop launcher with recursive scanning and source preservation.
 
 ### Fixed
+- Hash complete files when checking Windows source, output and cover signatures so same-clock-tick edits with restored timestamps cannot bypass validation.
+- Use Windows ChangeTime when validating file changes, detect the Windows locale without POSIX environment variables, find bundled FFmpeg tools beside the executable, and avoid encoding errors on redirected Windows output.
 - Bind metadata to the source version before probing and reject changed files before encoding, including files changed while queued.
 - Handle hardlinked inputs without mistaking our own unlinks for content changes; verify content hashes before deleting remaining names.
 - Revalidate changed cover cache entries and verify retained cover files before deleting originals.

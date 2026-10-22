@@ -1,0 +1,6 @@
+FROM docker.io/library/python:3.12-slim-trixie
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg binutils && rm -rf /var/lib/apt/lists/*
+RUN python -m pip install --no-cache-dir pyinstaller==6.22.0 'rich==15.0.0'
+WORKDIR /src
+CMD ["python", "packaging/build_linux.py"]

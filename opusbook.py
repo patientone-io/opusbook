@@ -9,6 +9,7 @@ import argparse
 import errno
 import hashlib
 import json
+import locale
 import math
 import os
 import re
@@ -25,6 +26,13 @@ from fractions import Fraction
 from pathlib import Path
 
 __version__ = "1.1.1"
+
+# Redirected Windows streams may use an ANSI code page that cannot encode
+# emoji or arbitrary filenames. Keep that encoding, but never crash on output.
+if sys.platform == "win32":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
 
 # ── Sprawdzenie zależności / Dependency check ───────────────────────────────
 try:
@@ -301,7 +309,8 @@ def detect_system_language() -> str:
             return "pl"
         elif val.startswith("en"):
             return "en"
-    return "en"
+    language = locale.getlocale()[0] or ""
+    return "pl" if language.lower().startswith(("pl", "polish")) else "en"
 
 _CURRENT_LANG = detect_system_language()
 
@@ -332,10 +341,10 @@ class ConversionResult:
     status: str  # "ok" | "skipped" | "failed"
     audio_duration: float = 0.0
     error: str = ""
-    source_signature: tuple[int, int, int, int, int] | None = None
-    output_signature: tuple[int, int, int, int, int] | None = None
+    source_signature: tuple[int, ...] | None = None
+    output_signature: tuple[int, ...] | None = None
     cover_path: Path | None = None
-    cover_signature: tuple[int, int, int, int, int] | None = None
+    cover_signature: tuple[int, ...] | None = None
 
     # Backward-compat aliases (old field name was mp3_bytes)
     @property
@@ -416,7 +425,7 @@ class FileInfo:
     duration: float = 0.0      # seconds
     channels: int = 0          # 1=mono, 2=stereo, 0=unknown
     has_cover: bool | None = None  # None means metadata inspection failed.
-    source_signature: tuple[int, int, int, int, int] | None = None
+    source_signature: tuple[int, ...] | None = None
     probe_error: str = ""
 
 
@@ -687,8 +696,19 @@ def _select_windows(
 
 # ── Narzędzia FFmpeg / Probing ─────────────────────────────────────────────
 
+def _find_tool(name: str) -> str:
+    # Only trust adjacent executables in a frozen distribution, never in an
+    # arbitrary working directory when running the Python package.
+    if getattr(sys, "frozen", False):
+        suffix = ".exe" if sys.platform == "win32" else ""
+        candidate = Path(sys.executable).resolve().parent / f"{name}{suffix}"
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which(name) or ""
+
+
 def check_ffmpeg() -> str:
-    path = shutil.which("ffmpeg")
+    path = _find_tool("ffmpeg")
     if not path:
         console.print(
             Panel(
@@ -714,12 +734,12 @@ def get_ffmpeg_version(ffmpeg_path: str) -> str:
 
 def find_ffprobe() -> str:
     """Finds ffprobe — typically in the same path as ffmpeg."""
-    p = shutil.which("ffprobe")
+    p = _find_tool("ffprobe")
     if p:
         return p
-    ff = shutil.which("ffmpeg")
+    ff = _find_tool("ffmpeg")
     if ff:
-        candidate = Path(ff).parent / "ffprobe"
+        candidate = Path(ff).parent / ("ffprobe.exe" if sys.platform == "win32" else "ffprobe")
         if candidate.exists() and os.access(candidate, os.X_OK):
             return str(candidate)
     return ""
@@ -863,7 +883,7 @@ def _safe_unlink(path: Path) -> None:
         pass
 
 
-def _publish_output(temp_out: Path, out: Path, force: bool) -> tuple[int, int, int, int, int]:
+def _publish_output(temp_out: Path, out: Path, force: bool) -> tuple[int, ...]:
     expected = temp_out.stat()
     if force:
         os.replace(temp_out, out)
@@ -896,7 +916,7 @@ def _publish_output(temp_out: Path, out: Path, force: bool) -> tuple[int, int, i
         expected.st_dev, expected.st_ino, expected.st_size,
     ):
         raise OSError(t("output_changed"))
-    return _stat_signature(published)
+    return _path_signature(out)
 
 
 # ── Konwersja / Conversion ─────────────────────────────────────────────────
@@ -906,13 +926,52 @@ def _stat_signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
 
+def _handle_signature(fd: int) -> tuple[int, int, int, int, int]:
+    signature = _stat_signature(os.fstat(fd))
+    if os.name != "nt":
+        return signature
+    # Windows stat().st_ctime is creation time, not the change time used by
+    # POSIX. Query ChangeTime so edits with a restored mtime are still detected.
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    class FileBasicInfo(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_longlong) for name in (
+            "CreationTime", "LastAccessTime", "LastWriteTime", "ChangeTime",
+        )] + [("FileAttributes", wintypes.DWORD)]
+
+    query = ctypes.WinDLL("kernel32", use_last_error=True).GetFileInformationByHandleEx
+    query.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    query.restype = wintypes.BOOL
+    info = FileBasicInfo()
+    if not query(msvcrt.get_osfhandle(fd), 0, ctypes.byref(info), ctypes.sizeof(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return (*signature[:4], info.ChangeTime * 100)
+
+
+def _path_signature(path: Path) -> tuple[int, ...]:
+    if os.name == "nt":
+        with path.open("rb") as source:
+            before = _handle_signature(source.fileno())
+            # NTFS can reuse ChangeTime for writes within one system clock tick.
+            # Hash all bytes so restored mtime cannot hide those changes.
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+            if _handle_signature(source.fileno()) != before:
+                raise OSError(t("source_changed"))
+            return (*before, int.from_bytes(digest.digest(), "big"))
+    return _stat_signature(path.stat())
+
+
 def _probe_file(file: Path, ffprobe: str) -> FileInfo:
     """Bind metadata to a source version before it enters the encoding queue."""
     info = FileInfo(path=file)
     try:
-        info.source_signature = _stat_signature(file.stat())
+        info.source_signature = _path_signature(file)
         info.duration, info.channels, info.has_cover = get_file_metadata(file, ffprobe)
-        if _stat_signature(file.stat()) != info.source_signature:
+        if _path_signature(file) != info.source_signature:
             info.probe_error = t("source_changed")
         elif info.has_cover is None:
             info.probe_error = t("metadata_failed")
@@ -923,7 +982,7 @@ def _probe_file(file: Path, ffprobe: str) -> FileInfo:
 
 def _check_signature(path: Path, expected: tuple | None, message: str) -> tuple:
     try:
-        current = _stat_signature(path.stat())
+        current = _path_signature(path)
     except OSError as error:
         raise OSError(t(message)) from error
     if expected is None or current != expected:
@@ -934,8 +993,8 @@ def _check_signature(path: Path, expected: tuple | None, message: str) -> tuple:
 def _cover_signature(path: Path, ffmpeg: str) -> tuple | None:
     """Only cache a cover if it stayed unchanged while being decoded."""
     try:
-        before = _stat_signature(path.stat())
-        if _valid_cover(path, ffmpeg) and _stat_signature(path.stat()) == before:
+        before = _path_signature(path)
+        if _valid_cover(path, ffmpeg) and _path_signature(path) == before:
             return before
     except OSError:
         pass
@@ -945,15 +1004,15 @@ def _cover_signature(path: Path, ffmpeg: str) -> tuple | None:
 def _source_digest(path: Path, expected: tuple) -> str:
     """Hash a stable source for batches containing multiple hardlink names."""
     with path.open("rb") as source:
-        before = _stat_signature(os.fstat(source.fileno()))
-        if before != expected:
+        before = _handle_signature(source.fileno())
+        if before != expected[:5]:
             raise OSError(t("source_changed"))
         digest = hashlib.sha256()
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
-        if _stat_signature(os.fstat(source.fileno())) != before:
+        if _handle_signature(source.fileno()) != before:
             raise OSError(t("source_changed"))
-    _check_signature(path, before, "source_changed")
+    _check_signature(path, expected, "source_changed")
     return digest.hexdigest()
 
 
@@ -970,7 +1029,7 @@ def _delete_converted_sources(results: list[ConversionResult]) -> tuple[int, int
     for result in results:
         try:
             expected = result.source_signature
-            current = _stat_signature(result.source.stat())
+            current = _path_signature(result.source)
             if expected is None:
                 raise OSError(t("source_changed"))
             key = expected[:2]
@@ -1014,7 +1073,9 @@ def convert_file(
     out = file.with_suffix(".opus")
     try:
         source_stat = file.stat()
-        source_signature = _stat_signature(source_stat)
+        source_signature = _path_signature(file)
+        if source_signature[:4] != _stat_signature(source_stat)[:4]:
+            raise OSError(t("source_changed"))
         src_bytes = source_stat.st_size
     except OSError as e:
         return ConversionResult(
@@ -1132,6 +1193,8 @@ def convert_file(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
         def stop_when_cancelled():
@@ -1214,7 +1277,7 @@ def convert_file(
                 error=err,
             )
 
-        if _stat_signature(file.stat()) != source_signature:
+        if _path_signature(file) != source_signature:
             raise RuntimeError(t("source_changed"))
 
         # Export covers before publishing audio, so a failed export keeps both
@@ -1226,7 +1289,7 @@ def convert_file(
             known_covers = extracted_covers if extracted_covers is not None else {}
             with (cover_lock if cover_lock is not None else nullcontext()):
                 try:
-                    cover_signature = _stat_signature(cover_path.stat())
+                    cover_signature = _path_signature(cover_path)
                 except OSError:
                     cover_signature = None
                 if cover_signature is None or known_covers.get(cover_path) != cover_signature:
@@ -1241,7 +1304,7 @@ def convert_file(
 
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("conversion cancelled")
-        if _stat_signature(file.stat()) != source_signature:
+        if _path_signature(file) != source_signature:
             raise RuntimeError(t("source_changed"))
 
         # mkstemp uses 0600; keep media readable wherever the source was readable.
