@@ -317,6 +317,20 @@ def test_cli_rejects_output_collisions_before_probing(tmp_path, monkeypatch, for
     assert len(list(tmp_path.iterdir())) == 2
 
 
+def test_cli_rejects_case_insensitive_output_collisions(tmp_path, monkeypatch):
+    (tmp_path / "Chapter01.mp3").write_bytes(b"source1")
+    (tmp_path / "chapter01.m4b").write_bytes(b"source2")
+    monkeypatch.setattr(ob, "check_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(ob, "get_ffmpeg_version", lambda p: "test")
+    monkeypatch.setattr(ob, "find_ffprobe", lambda: "ffprobe")
+    monkeypatch.setattr(ob.os.path, "samefile", lambda a, b: True)
+    with patch.object(ob, "get_file_metadata") as probe:
+        with pytest.raises(SystemExit) as error:
+            ob.main([str(tmp_path), "-b", "64k", "--keep"])
+    assert error.value.code == 1
+    probe.assert_not_called()
+
+
 @pytest.mark.parametrize("fallback", [False, True])
 def test_publish_does_not_overwrite_racing_output(tmp_path, fallback):
     temporary = tmp_path / "temporary.opus"

@@ -23,6 +23,7 @@ htmlcov/
 *.opus
 cover.jpg
 
-# Lokalne konfiguracje / sekrety
+# Lokalne konfiguracje / sekrety / notatki robocze
 .env
 *.env
+future.md

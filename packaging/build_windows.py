@@ -82,7 +82,10 @@ def main():
         shutil.copy2(Path(sys.base_prefix) / "LICENSE.txt", notices / "Python-LICENSE.txt")
         shutil.copy2(ROOT / "LICENSE", bundle)
         shutil.copy2(ROOT / "packaging" / "windows-README.txt", bundle / "README.txt")
-        version = importlib.metadata.version("opusbook")
+        # Read the version from the actual source, not a stale installed wheel.
+        sys.path.insert(0, str(ROOT))
+        import opusbook
+        version = opusbook.__version__
         (bundle / "BUILD.json").write_text(json.dumps({
             "opusbook": version, "python": sys.version,
             "source_sha256": sha256_file(ROOT / "opusbook.py"),

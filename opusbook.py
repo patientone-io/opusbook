@@ -1693,13 +1693,32 @@ def main(argv: list[str] | None = None):
         )
         sys.exit(0)
 
-    outputs: set[Path] = set()
+    def _is_case_insensitive_file(sample: Path) -> bool:
+        if os.name == "nt":
+            return True
+        swapped = sample.name.swapcase()
+        if swapped == sample.name:
+            return False
+        try:
+            return os.path.samefile(sample, sample.with_name(swapped))
+        except OSError:
+            return False
+
+    case_insensitive_dirs: dict[Path, bool] = {}
+    outputs: set[tuple[Path, str]] = set()
     for source in raw_files:
         output = source.with_suffix(".opus")
-        if output in outputs:
+        parent = output.parent
+        if parent not in case_insensitive_dirs:
+            case_insensitive_dirs[parent] = _is_case_insensitive_file(source)
+        output_key = (
+            parent,
+            output.name.casefold() if case_insensitive_dirs[parent] else output.name,
+        )
+        if output_key in outputs:
             console.print(t("output_collision", path=escape(str(output))))
             sys.exit(1)
-        outputs.add(output)
+        outputs.add(output_key)
 
     # ── Pobieranie metadanych / Probing metadata ──
     file_infos: list[FileInfo] = []
@@ -1730,6 +1749,7 @@ def main(argv: list[str] | None = None):
     total_seconds = sum(info.duration for info in file_infos)
     covers_count = sum(1 for info in file_infos if info.has_cover)
     mono_count = sum(1 for info in file_infos if info.channels == 1)
+    stereo_count = sum(1 for info in file_infos if info.channels > 1)
 
     # ── Nagłówek informacyjny / Info panel ──
     yes_str = t("yes")
@@ -1746,7 +1766,7 @@ def main(argv: list[str] | None = None):
         f"[dim]({fmt_mb(total_mp3_mb)}, [bold]{fmt_duration(total_seconds)}[/] audio)[/]"
     )
     if args.auto and mono_count:
-        header_line += f"  [dim]· {mono_count} mono, {len(file_infos)-mono_count} stereo[/]"
+        header_line += f"  [dim]· {mono_count} mono, {stereo_count} stereo[/]"
     if covers_count:
         header_line += f"  [dim]· {covers_count} {t('with_cover')}[/]"
 
